@@ -1,7 +1,9 @@
 # OptiFlow
 
 How to run:
+
 Activate venv: source /Users/pavelkurta/My/workspace/OptiFlow/.venv/bin/activate
+
 Launch: python -m optiflow.app
 
 **v1**
