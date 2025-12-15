@@ -7,10 +7,15 @@ Activate venv: source /Users/pavelkurta/My/workspace/OptiFlow/.venv/bin/activate
 Launch: python -m optiflow.app
 
 **v1**
-* Built a PyQt desktop app with tabs: “Данные, тип, длина”, “Настройка задачи”, “Алгоритмы”, “Графики”.
-* Implemented coefficient sliders that always normalize to sum=1.
-* Designed a function registry for per-control scoring with safe exec. Added sensible defaults for all listed controls.
-* Added algorithms: NSGA-II-style MOEA, hill climbing (as gradient descent proxy on discrete space), PSO, and random search. Plots compare best-score histories.
-* Implemented HTML export for the chosen/best layout.
+* PyQt‑приложение с вкладками: «Данные, тип, длина», «Настройка задачи», «Алгоритмы», «Графики».
+* Ползунки коэффициентов всегда нормализуют веса до суммы 1.
+* Реестр функций для оценки контролов с безопасным exec; заданы разумные дефолты для всех контролов.
+* Алгоритмы: NSGA-II (многокритериальный), hill climbing (локальный поиск на дискретном пространстве), PSO и случайный поиск; графики сравнивают лучшую историю скоринга.
+* Экспорт в HTML для выбранного/лучшего набора контролов.
 
-You can edit per-control functions in the “Настройка задачи” tab. Define fields and sizes in “Данные, тип, длина”, tune weights via sliders, choose algorithm and params in “Алгоритмы”, run, view comparison in “Графики”, and export HTML via menu “Файл → Экспорт веб-страницы”.
+**v1.1**
+* Расширен набор алгоритмов: жадный подбор (Greedy), имитация отжига (SA), поиск с запретами (Tabu), муравьиный алгоритм (ACO) — все сравниваются на графике и сохраняют лучший набор контролов.
+* Интерфейс выбора алгоритма переименован и теперь показывает свои параметры динамически (NSGA-II, Hill Climb, PSO, Random, SA, Tabu, ACO); для невыбранных алгоритмов используются их дефолты из схемы.
+* Экспорт HTML учитывает новые алгоритмы и выбирает лучший результат с приоритетом выбранного.
+
+Можно редактировать функции для контролов во вкладке «Настройка задачи». Поля и размеры задаются в «Данные, тип, длина»; веса настраиваются ползунками; алгоритм и параметры выбираются в «Алгоритмы»; запуск — там же; сравнение видно на вкладке «Графики»; экспорт HTML — через меню «Файл → Экспорт веб-страницы».

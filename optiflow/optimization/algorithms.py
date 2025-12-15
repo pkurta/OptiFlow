@@ -336,3 +336,188 @@ def random_search(space: DecisionSpace, evaluator: ObjectiveEvaluator, iteration
     return {"best_score": best_score, "history": history, "best_controls": best_controls}
 
 
+def greedy(space: DecisionSpace, evaluator: ObjectiveEvaluator) -> Dict[str, object]:
+    """
+    Поскольку итоговый скор есть среднее по полям, оптимальный по этому критерию
+    контроль для каждого поля можно выбрать независимо.
+    """
+    chosen_controls: List[ControlType] = []
+    per_field_scores: List[float] = []
+    for field in space.fields:
+        best_idx = 0
+        best_score = -1.0
+        for idx, ctrl in enumerate(field.allowed_controls()):
+            triple = evaluator.registry.evaluate(ctrl, field.data_type, field.size)
+            score = float(np.dot(np.array(triple, dtype=float), np.array(evaluator.weights)))
+            if score > best_score:
+                best_score = score
+                best_idx = idx
+        chosen_controls.append(field.allowed_controls()[best_idx])
+        per_field_scores.append(best_score)
+    overall = float(np.mean(per_field_scores)) if per_field_scores else 0.0
+    return {"best_score": overall, "history": [overall], "best_controls": chosen_controls}
+
+
+def simulated_annealing(
+    space: DecisionSpace,
+    evaluator: ObjectiveEvaluator,
+    iterations: int = 300,
+    initial_temp: float = 5.0,
+    cooling: float = 0.97,
+    random_seed: int | None = None,
+):
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+
+    current = space.round_to_valid(space.random_vector())
+    current_controls = space.all_controls(current)
+    current_score = evaluator.scalar_fitness(current_controls, space.fields)
+    best_controls = current_controls
+    best_score = current_score
+    history = [best_score]
+    temp = initial_temp
+
+    for _ in range(iterations):
+        i = random.randrange(len(space.fields))
+        field = space.fields[i]
+        candidate_idx = random.randrange(len(field.allowed_controls()))
+        candidate_vec = list(current)
+        candidate_vec[i] = candidate_idx
+        candidate_controls = space.all_controls(candidate_vec)
+        candidate_score = evaluator.scalar_fitness(candidate_controls, space.fields)
+        delta = candidate_score - current_score
+        if delta > 0 or random.random() < math.exp(delta / max(1e-9, temp)):
+            current = candidate_vec
+            current_controls = candidate_controls
+            current_score = candidate_score
+        if current_score > best_score:
+            best_score = current_score
+            best_controls = current_controls
+        history.append(best_score)
+        temp *= cooling
+
+    return {"best_score": best_score, "history": history, "best_controls": best_controls}
+
+
+def tabu_search(
+    space: DecisionSpace,
+    evaluator: ObjectiveEvaluator,
+    iterations: int = 200,
+    tabu_tenure: int = 7,
+    random_seed: int | None = None,
+):
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+
+    current = space.round_to_valid(space.random_vector())
+    current_controls = space.all_controls(current)
+    current_score = evaluator.scalar_fitness(current_controls, space.fields)
+    best_controls = current_controls
+    best_score = current_score
+    history = [best_score]
+    tabu_list: List[Tuple[int, int]] = []
+
+    for _ in range(iterations):
+        best_neighbor: Tuple[List[int], float] | None = None
+        move_used: Tuple[int, int] | None = None
+        for i, field in enumerate(space.fields):
+            for idx in range(len(field.allowed_controls())):
+                if idx == current[i]:
+                    continue
+                move = (i, idx)
+                candidate_vec = list(current)
+                candidate_vec[i] = idx
+                candidate_controls = space.all_controls(candidate_vec)
+                candidate_score = evaluator.scalar_fitness(candidate_controls, space.fields)
+                is_tabu = move in tabu_list
+                aspiration = candidate_score > best_score
+                if is_tabu and not aspiration:
+                    continue
+                if best_neighbor is None or candidate_score > best_neighbor[1]:
+                    best_neighbor = (candidate_vec, candidate_score)
+                    move_used = move
+        if best_neighbor is None:
+            break
+        current = best_neighbor[0]
+        current_controls = space.all_controls(current)
+        current_score = best_neighbor[1]
+        if move_used:
+            tabu_list.append(move_used)
+            if len(tabu_list) > tabu_tenure:
+                tabu_list.pop(0)
+        if current_score > best_score:
+            best_score = current_score
+            best_controls = current_controls
+        history.append(best_score)
+
+    return {"best_score": best_score, "history": history, "best_controls": best_controls}
+
+
+def aco(
+    space: DecisionSpace,
+    evaluator: ObjectiveEvaluator,
+    ants: int = 20,
+    iterations: int = 40,
+    alpha: float = 1.0,
+    beta: float = 2.0,
+    evaporation: float = 0.1,
+    deposit_weight: float = 1.0,
+    random_seed: int | None = None,
+):
+    if random_seed is not None:
+        random.seed(random_seed)
+        np.random.seed(random_seed)
+
+    num_fields = len(space.fields)
+    allowed = [field.allowed_controls() for field in space.fields]
+    max_controls = max(len(c) for c in allowed) if allowed else 0
+    pheromone = np.ones((num_fields, max_controls), dtype=float)
+
+    # эвристика: локальный скор конкретного контрола для поля
+    heuristic = np.zeros_like(pheromone)
+    for i, field in enumerate(space.fields):
+        for j, ctrl in enumerate(allowed[i]):
+            triple = evaluator.registry.evaluate(ctrl, field.data_type, field.size)
+            heuristic[i, j] = float(np.dot(np.array(triple, dtype=float), np.array(evaluator.weights)))
+
+    best_controls: List[ControlType] | None = None
+    best_score = -1.0
+    history: List[float] = []
+
+    for _ in range(iterations):
+        iteration_best = -1.0
+        iteration_best_controls: List[ControlType] | None = None
+        for _ant in range(ants):
+            chosen_indexes: List[int] = []
+            for i, field in enumerate(space.fields):
+                options = len(allowed[i])
+                tau = pheromone[i, :options] ** alpha
+                eta = heuristic[i, :options] ** beta
+                probs = tau * eta
+                if np.sum(probs) <= 0:
+                    probs = np.ones_like(probs)
+                probs = probs / np.sum(probs)
+                idx = int(np.random.choice(np.arange(options), p=probs))
+                chosen_indexes.append(idx)
+            controls = space.all_controls(chosen_indexes)
+            score = evaluator.scalar_fitness(controls, space.fields)
+            if score > iteration_best:
+                iteration_best = score
+                iteration_best_controls = controls
+        # испарение
+        pheromone *= (1.0 - evaporation)
+        if iteration_best_controls is not None:
+            # усиливаем след по лучшему решению итерации
+            for i, ctrl in enumerate(iteration_best_controls):
+                idx = allowed[i].index(ctrl)
+                pheromone[i, idx] += deposit_weight * iteration_best
+            if iteration_best > best_score:
+                best_score = iteration_best
+                best_controls = iteration_best_controls
+        history.append(best_score if best_score >= 0 else iteration_best)
+
+    return {"best_score": best_score, "history": history, "best_controls": best_controls}
+
+

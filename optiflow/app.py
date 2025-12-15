@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -16,10 +16,14 @@ from optiflow.models.scoring import (
 from optiflow.optimization.algorithms import (
     DecisionSpace,
     ObjectiveEvaluator,
+    aco,
+    greedy,
     hill_climb,
     nsga2,
     pso,
     random_search,
+    simulated_annealing,
+    tabu_search,
 )
 from optiflow.ui.web_generator import generate_html
 
@@ -147,33 +151,120 @@ class FunctionEditor(QtWidgets.QWidget):
 class AlgorithmsTab(QtWidgets.QWidget):
     runRequested = QtCore.pyqtSignal()
 
+    PARAM_SCHEMAS: Dict[str, List[Dict[str, object]]] = {
+        "Многокритериальный (NSGA-II)": [
+            {"key": "pop_size", "label": "Размер популяции", "type": "int", "min": 10, "max": 2000, "default": 40, "step": 10},
+            {"key": "generations", "label": "Поколения", "type": "int", "min": 1, "max": 2000, "default": 40, "step": 5},
+            {"key": "crossover_prob", "label": "Вероятность кроссовера", "type": "float", "min": 0.0, "max": 1.0, "default": 0.9, "step": 0.05, "decimals": 3},
+            {"key": "mutation_prob", "label": "Вероятность мутации", "type": "float", "min": 0.0, "max": 1.0, "default": 0.2, "step": 0.05, "decimals": 3},
+            {"key": "mutation_sigma", "label": "Сигма мутации", "type": "float", "min": 0.01, "max": 5.0, "default": 0.5, "step": 0.05, "decimals": 3},
+        ],
+        "Локальный поиск (Hill Climb)": [
+            {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 5000, "default": 200, "step": 10},
+        ],
+        "Алгоритм роя частиц (PSO)": [
+            {"key": "swarm_size", "label": "Размер роя", "type": "int", "min": 5, "max": 2000, "default": 30, "step": 5},
+            {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 5000, "default": 50, "step": 5},
+            {"key": "inertia", "label": "Инерция", "type": "float", "min": 0.0, "max": 2.0, "default": 0.7, "step": 0.05, "decimals": 3},
+            {"key": "cognitive", "label": "Cognitive", "type": "float", "min": 0.0, "max": 5.0, "default": 1.5, "step": 0.1, "decimals": 3},
+            {"key": "social", "label": "Social", "type": "float", "min": 0.0, "max": 5.0, "default": 1.5, "step": 0.1, "decimals": 3},
+        ],
+        "Случайный поиск": [
+            {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 200, "step": 50},
+        ],
+        "Жадный (Greedy)": [],
+        "Имитация отжига (SA)": [
+            {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 300, "step": 50},
+            {"key": "initial_temp", "label": "Начальная температура", "type": "float", "min": 0.1, "max": 100.0, "default": 5.0, "step": 0.5, "decimals": 3},
+            {"key": "cooling", "label": "Коэффициент охлаждения", "type": "float", "min": 0.80, "max": 0.999, "default": 0.97, "step": 0.001, "decimals": 4},
+        ],
+        "Поиск с запретами (Tabu)": [
+            {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 200, "step": 20},
+            {"key": "tabu_tenure", "label": "Длина табу-списка", "type": "int", "min": 1, "max": 200, "default": 7, "step": 1},
+        ],
+        "Муравьиный алгоритм (ACO)": [
+            {"key": "ants", "label": "Количество муравьёв", "type": "int", "min": 1, "max": 500, "default": 20, "step": 5},
+            {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 2000, "default": 40, "step": 5},
+            {"key": "alpha", "label": "Вес феромона (alpha)", "type": "float", "min": 0.0, "max": 5.0, "default": 1.0, "step": 0.1, "decimals": 3},
+            {"key": "beta", "label": "Вес эвристики (beta)", "type": "float", "min": 0.0, "max": 5.0, "default": 2.0, "step": 0.1, "decimals": 3},
+            {"key": "evaporation", "label": "Испарение", "type": "float", "min": 0.0, "max": 1.0, "default": 0.1, "step": 0.01, "decimals": 3},
+            {"key": "deposit_weight", "label": "Депозит феромона", "type": "float", "min": 0.0, "max": 10.0, "default": 1.0, "step": 0.1, "decimals": 3},
+        ],
+    }
+
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         layout = QtWidgets.QFormLayout(self)
         # Common params
         self.algorithm_combo = QtWidgets.QComboBox()
-        self.algorithm_combo.addItems(["NSGA-II", "Градиентный спуск (Hill Climb)", "PSO", "Случайный поиск"])
+        self.algorithm_combo.addItems([
+            "Многокритериальный (NSGA-II)",
+            "Локальный поиск (Hill Climb)",
+            "Алгоритм роя частиц (PSO)",
+            "Случайный поиск",
+            "Жадный (Greedy)",
+            "Имитация отжига (SA)",
+            "Поиск с запретами (Tabu)",
+            "Муравьиный алгоритм (ACO)",
+        ])
         layout.addRow("Алгоритм:", self.algorithm_combo)
 
-        self.param1 = QtWidgets.QSpinBox()
-        self.param1.setRange(10, 1000)
-        self.param1.setValue(40)
-        layout.addRow("Размер популяции/рой/итерации:", self.param1)
-
-        self.param2 = QtWidgets.QSpinBox()
-        self.param2.setRange(1, 1000)
-        self.param2.setValue(40)
-        layout.addRow("Поколения/итерации:", self.param2)
+        self.param_controls: List[Tuple[QtWidgets.QLabel, QtWidgets.QDoubleSpinBox]] = []
+        max_params = max(len(v) for v in self.PARAM_SCHEMAS.values())
+        for _ in range(max_params):
+            lbl = QtWidgets.QLabel("")
+            spin = QtWidgets.QDoubleSpinBox()
+            spin.setDecimals(3)
+            spin.setRange(-1e6, 1e6)
+            spin.setSingleStep(1.0)
+            layout.addRow(lbl, spin)
+            self.param_controls.append((lbl, spin))
 
         self.run_btn = QtWidgets.QPushButton("Запустить")
         self.run_btn.clicked.connect(self.runRequested.emit)
         layout.addRow(self.run_btn)
 
+        self.algorithm_combo.currentTextChanged.connect(self._on_algorithm_changed)
+        self._on_algorithm_changed(self.algorithm_combo.currentText())
+
     def current_algorithm(self) -> str:
         return self.algorithm_combo.currentText()
 
-    def params(self) -> Tuple[int, int]:
-        return self.param1.value(), self.param2.value()
+    def _apply_config(self, control: QtWidgets.QDoubleSpinBox, cfg: Dict[str, object]) -> None:
+        decimals = int(cfg.get("decimals", 2))
+        control.setDecimals(decimals)
+        control.setSingleStep(float(cfg.get("step", 1.0)))
+        control.setRange(float(cfg.get("min", 0.0)), float(cfg.get("max", 1e6)))
+        control.setValue(float(cfg.get("default", 0.0)))
+
+    def _on_algorithm_changed(self, name: str) -> None:
+        schema = self.PARAM_SCHEMAS.get(name, [])
+        for i, (lbl, spin) in enumerate(self.param_controls):
+            if i < len(schema):
+                cfg = schema[i]
+                lbl.setText(str(cfg.get("label", f"Параметр {i+1}")))
+                self._apply_config(spin, cfg)
+                lbl.setVisible(True)
+                spin.setVisible(True)
+            else:
+                lbl.setVisible(False)
+                spin.setVisible(False)
+
+    def params_for(self, algorithm_name: str) -> Dict[str, float]:
+        schema = self.PARAM_SCHEMAS.get(algorithm_name, [])
+        values: Dict[str, float] = {}
+        use_current = algorithm_name == self.current_algorithm()
+        for idx, cfg in enumerate(schema):
+            val = (
+                self.param_controls[idx][1].value()
+                if use_current
+                else float(cfg.get("default", 0.0))
+            )
+            if cfg.get("type") == "int":
+                values[cfg["key"]] = int(round(val))
+            else:
+                values[cfg["key"]] = float(val)
+        return values
 
 
 class ChartsTab(QtWidgets.QWidget):
@@ -274,19 +365,72 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def run_algorithms(self) -> None:
         space, evaluator = self._build_space()
-        alg = self.alg_tab.current_algorithm()
-        p1, p2 = self.alg_tab.params()
         histories: List[Tuple[str, List[float]]] = []
 
-        # Always run all for comparison and plot
-        res_nsga = nsga2(space, evaluator, pop_size=p1, generations=p2)
-        res_hc = hill_climb(space, evaluator, iterations=p1)
-        res_pso = pso(space, evaluator, swarm_size=p1, iterations=p2)
-        res_rs = random_search(space, evaluator, iterations=p1)
+        def params(name: str) -> Dict[str, float]:
+            return self.alg_tab.params_for(name)
+
+        p_nsga = params("Многокритериальный (NSGA-II)")
+        p_hc = params("Локальный поиск (Hill Climb)")
+        p_pso = params("Алгоритм роя частиц (PSO)")
+        p_rs = params("Случайный поиск")
+        p_sa = params("Имитация отжига (SA)")
+        p_tabu = params("Поиск с запретами (Tabu)")
+        p_aco = params("Муравьиный алгоритм (ACO)")
+
+        # Always run all for comparison and plot (неселектed берут дефолты)
+        res_nsga = nsga2(
+            space,
+            evaluator,
+            pop_size=int(p_nsga.get("pop_size", 40)),
+            generations=int(p_nsga.get("generations", 40)),
+            crossover_prob=float(p_nsga.get("crossover_prob", 0.9)),
+            mutation_prob=float(p_nsga.get("mutation_prob", 0.2)),
+            mutation_sigma=float(p_nsga.get("mutation_sigma", 0.5)),
+        )
+        res_hc = hill_climb(space, evaluator, iterations=int(p_hc.get("iterations", 200)))
+        res_pso = pso(
+            space,
+            evaluator,
+            swarm_size=int(p_pso.get("swarm_size", 30)),
+            iterations=int(p_pso.get("iterations", 50)),
+            inertia=float(p_pso.get("inertia", 0.7)),
+            cognitive=float(p_pso.get("cognitive", 1.5)),
+            social=float(p_pso.get("social", 1.5)),
+        )
+        res_rs = random_search(space, evaluator, iterations=int(p_rs.get("iterations", 200)))
+        res_greedy = greedy(space, evaluator)
+        res_sa = simulated_annealing(
+            space,
+            evaluator,
+            iterations=int(p_sa.get("iterations", 300)),
+            initial_temp=float(p_sa.get("initial_temp", 5.0)),
+            cooling=float(p_sa.get("cooling", 0.97)),
+        )
+        res_tabu = tabu_search(
+            space,
+            evaluator,
+            iterations=int(p_tabu.get("iterations", 200)),
+            tabu_tenure=int(p_tabu.get("tabu_tenure", 7)),
+        )
+        res_aco = aco(
+            space,
+            evaluator,
+            ants=int(p_aco.get("ants", 20)),
+            iterations=int(p_aco.get("iterations", 40)),
+            alpha=float(p_aco.get("alpha", 1.0)),
+            beta=float(p_aco.get("beta", 2.0)),
+            evaporation=float(p_aco.get("evaporation", 0.1)),
+            deposit_weight=float(p_aco.get("deposit_weight", 1.0)),
+        )
         histories.append(("NSGA-II", res_nsga["history"]))
         histories.append(("HillClimb", res_hc["history"]))
         histories.append(("PSO", res_pso["history"]))
         histories.append(("Random", res_rs["history"]))
+        histories.append(("Greedy", res_greedy["history"]))
+        histories.append(("SA", res_sa["history"]))
+        histories.append(("Tabu", res_tabu["history"]))
+        histories.append(("ACO", res_aco["history"]))
         self.charts_tab.plot_histories(histories)
 
         # store last best controls
@@ -295,6 +439,10 @@ class MainWindow(QtWidgets.QMainWindow):
             "HillClimb": res_hc.get("best_controls"),
             "PSO": res_pso.get("best_controls"),
             "Random": res_rs.get("best_controls"),
+            "Greedy": res_greedy.get("best_controls"),
+            "SA": res_sa.get("best_controls"),
+            "Tabu": res_tabu.get("best_controls"),
+            "ACO": res_aco.get("best_controls"),
         }
 
     def export_web(self) -> None:
@@ -303,7 +451,18 @@ class MainWindow(QtWidgets.QMainWindow):
         controls = None
         # prefer selected algorithm if available
         preferred = self.alg_tab.current_algorithm()
-        key_order = [preferred, "NSGA-II", "PSO", "HillClimb", "Random"]
+        name_map = {
+            "Многокритериальный (NSGA-II)": "NSGA-II",
+            "Локальный поиск (Hill Climb)": "HillClimb",
+            "Алгоритм роя частиц (PSO)": "PSO",
+            "Случайный поиск": "Random",
+            "Жадный (Greedy)": "Greedy",
+            "Имитация отжига (SA)": "SA",
+            "Поиск с запретами (Tabu)": "Tabu",
+            "Муравьиный алгоритм (ACO)": "ACO",
+        }
+        preferred_key = name_map.get(preferred, preferred)
+        key_order = [preferred_key, "NSGA-II", "PSO", "HillClimb", "Random", "Greedy", "SA", "Tabu", "ACO"]
         for key in key_order:
             if hasattr(self, "last_best_controls") and self.last_best_controls.get(key):
                 controls = self.last_best_controls[key]
