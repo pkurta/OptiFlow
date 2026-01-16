@@ -1,5 +1,11 @@
 # OptiFlow
 
+## Скриншоты
+
+![Главная форма - Выбор данных](docs/screenshots/optyflow01.webp)
+![Выбор алгоритма](docs/screenshots/optyflow03.webp)
+
+
 How to run:
 
 Activate venv: source /Users/pavelkurta/My/workspace/OptiFlow/.venv/bin/activate
