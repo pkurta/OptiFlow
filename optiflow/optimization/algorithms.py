@@ -2,522 +2,911 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass
-from typing import Callable, Dict, List, Tuple
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from optiflow.models.scoring import ControlType, FieldSpec, FunctionRegistry, ScoreTriple
+from optiflow.models.scoring import (
+  ControlType,
+  EfficiencyTriple,
+  FieldSpec,
+  FunctionRegistry,
+  InterfaceLayout,
+  build_interface_layout,
+  build_interface_layout_from_partition,
+  evaluate_form,
+  partition_counts_to_form_indices,
+)
+from optiflow.optimization.corrections import (
+  apply_element_position_correction,
+  apply_form_step_correction,
+)
 
 
 def clamp(value: float, low: float, high: float) -> float:
-    return max(low, min(high, value))
+  return max(low, min(high, value))
 
 
-def weighted_score(scores: List[ScoreTriple], weights: Tuple[float, float, float]) -> float:
-    w = np.array(weights, dtype=float)
-    s = np.array(scores, dtype=float)
-    return float(np.mean(s @ w))
+class TargetMode(Enum):
+  Certain = auto()
+  Max = auto()
+  Any = auto()
 
 
-def sum_objectives(scores: List[ScoreTriple]) -> ScoreTriple:
-    s = np.array(scores, dtype=float)
-    totals = np.mean(s, axis=0)
-    return float(totals[0]), float(totals[1]), float(totals[2])
+@dataclass
+class ComponentTarget:
+  mode: TargetMode = TargetMode.Any
+  value: float = 0.0
+
+
+@dataclass
+class TargetProfile:
+  potency: ComponentTarget = field(default_factory=ComponentTarget)
+  operativeness: ComponentTarget = field(default_factory=ComponentTarget)
+  resource_saving: ComponentTarget = field(default_factory=ComponentTarget)
+
+  @classmethod
+  def balanced(cls) -> TargetProfile:
+    return cls(
+      potency=ComponentTarget(TargetMode.Any),
+      operativeness=ComponentTarget(TargetMode.Any),
+      resource_saving=ComponentTarget(TargetMode.Any),
+    )
+
+  @classmethod
+  def maximize_potency(cls) -> TargetProfile:
+    return cls(
+      potency=ComponentTarget(TargetMode.Max),
+      operativeness=ComponentTarget(TargetMode.Any),
+      resource_saving=ComponentTarget(TargetMode.Any),
+    )
+
+
+def compute_total_efficiency(layout: InterfaceLayout, registry: FunctionRegistry) -> EfficiencyTriple:
+  """
+  Equation (1): Total = ∏(corrected forms) × ∏(double-corrected elements).
+  """
+  total = EfficiencyTriple.identity()
+
+  for form in layout.forms:
+    i = form.form_index
+    form_atomic = evaluate_form(len(form.elements))
+    form_corrected = apply_form_step_correction(form_atomic, i)
+    total = total * form_corrected
+
+    for element in form.elements:
+      field = layout.fields[element.field_index]
+      atomic = registry.evaluate_atomic(element.control, field.data_type, field.size)
+      with_position = apply_element_position_correction(atomic, element.position_index)
+      double_corrected = apply_form_step_correction(with_position, i)
+      total = total * double_corrected
+
+  return total
+
+
+def triple_to_objective_tuple(triple: EfficiencyTriple) -> Tuple[float, float, float]:
+  return triple.as_tuple()
+
+
+def select_from_pareto(
+  objectives: List[EfficiencyTriple],
+  profile: TargetProfile,
+) -> int:
+  if not objectives:
+    return 0
+
+  indexes = list(range(len(objectives)))
+
+  def filter_by_component(
+    candidates: List[int],
+    getter: Callable[[EfficiencyTriple], float],
+    target: ComponentTarget,
+  ) -> List[int]:
+    if target.mode == TargetMode.Any or not candidates:
+      return candidates
+    if target.mode == TargetMode.Max:
+      best_val = max(getter(objectives[i]) for i in candidates)
+      return [i for i in candidates if getter(objectives[i]) >= best_val - 1e-12]
+    desired = clamp(target.value, 0.0, 1.0)
+    return [min(candidates, key=lambda i: abs(getter(objectives[i]) - desired))]
+
+  indexes = filter_by_component(indexes, lambda t: t.potency, profile.potency)
+  indexes = filter_by_component(indexes, lambda t: t.operativeness, profile.operativeness)
+  indexes = filter_by_component(indexes, lambda t: t.resource_saving, profile.resource_saving)
+
+  if len(indexes) == 1:
+    return indexes[0]
+
+  return max(
+    indexes,
+    key=lambda i: scalar_fitness_from_triple(objectives[i], profile),
+  )
+
+
+def profile_from_slider_values(v1: int, v2: int, v3: int) -> TargetProfile:
+  """Map raw slider positions (0–100) to TargetProfile modes; 100 → Max for that dimension."""
+
+  def component(raw: int) -> ComponentTarget:
+    v = int(clamp(float(raw), 0.0, 100.0))
+    if v >= 100:
+      return ComponentTarget(TargetMode.Max, 1.0)
+    if v > 0:
+      return ComponentTarget(TargetMode.Certain, v / 100.0)
+    return ComponentTarget(TargetMode.Any, 0.0)
+
+  return TargetProfile(
+    potency=component(v1),
+    operativeness=component(v2),
+    resource_saving=component(v3),
+  )
+
+
+def profile_from_slider_weights(w1: float, w2: float, w3: float) -> TargetProfile:
+  """Backward-compatible wrapper: normalized weights mapped to 0–100 slider semantics."""
+  return profile_from_slider_values(
+    int(round(clamp(w1, 0.0, 1.0) * 100)),
+    int(round(clamp(w2, 0.0, 1.0) * 100)),
+    int(round(clamp(w3, 0.0, 1.0) * 100)),
+  )
+
+
+def scalar_fitness_from_triple(
+  triple: EfficiencyTriple,
+  profile: TargetProfile,
+  weights: Optional[Sequence[float]] = None,
+) -> float:
+  """
+  Kurta-Izrailov scalar fitness for single-objective metaheuristics.
+
+  Max mode: strict per-component isolation (never the triple product).
+  Certain / Any mode: weighted linear projection; optional ``weights`` override
+  profile-derived coefficients as (w_P, w_O, w_R).
+  """
+  max_values: List[float] = []
+  if profile.potency.mode == TargetMode.Max:
+    max_values.append(triple.potency)
+  if profile.operativeness.mode == TargetMode.Max:
+    max_values.append(triple.operativeness)
+  if profile.resource_saving.mode == TargetMode.Max:
+    max_values.append(triple.resource_saving)
+
+  if len(max_values) == 1:
+    return max_values[0]
+  if len(max_values) > 1:
+    return min(max_values)
+
+  if weights is not None and len(weights) >= 3:
+    w_p, w_o, w_r = (max(0.0, float(weights[0])), max(0.0, float(weights[1])), max(0.0, float(weights[2])))
+    total_w = w_p + w_o + w_r
+    if total_w <= 0.0:
+      return (triple.potency + triple.operativeness + triple.resource_saving) / 3.0
+    return (
+      w_p * triple.potency + w_o * triple.operativeness + w_r * triple.resource_saving
+    ) / total_w
+
+  coeff: List[float] = []
+  values: List[float] = []
+  for target, value in (
+    (profile.potency, triple.potency),
+    (profile.operativeness, triple.operativeness),
+    (profile.resource_saving, triple.resource_saving),
+  ):
+    if target.mode == TargetMode.Certain:
+      coeff.append(max(1e-9, clamp(target.value, 0.0, 1.0)))
+      values.append(value)
+    elif target.mode == TargetMode.Any:
+      coeff.append(1.0)
+      values.append(value)
+
+  if not coeff:
+    return (triple.potency + triple.operativeness + triple.resource_saving) / 3.0
+
+  total_w = sum(coeff)
+  return sum(w * v for w, v in zip(coeff, values)) / total_w
+
+
+def profile_constraints_satisfied(triple: EfficiencyTriple, profile: TargetProfile, tol: float = 1e-6) -> bool:
+  """Return True when Certain-mode targets are met within tolerance."""
+  if profile.potency.mode == TargetMode.Certain:
+    if abs(triple.potency - clamp(profile.potency.value, 0.0, 1.0)) > tol:
+      return False
+  if profile.operativeness.mode == TargetMode.Certain:
+    if abs(triple.operativeness - clamp(profile.operativeness.value, 0.0, 1.0)) > tol:
+      return False
+  if profile.resource_saving.mode == TargetMode.Certain:
+    if abs(triple.resource_saving - clamp(profile.resource_saving.value, 0.0, 1.0)) > tol:
+      return False
+  return True
 
 
 @dataclass
 class DecisionSpace:
-    fields: List[FieldSpec]
+  """
+  Genome structure (Kurta-Izrailov parametric synthesis):
+    Part 1 — length D: control type index per field (preserves field order).
+    Part 2 — length N: partition weights → field counts per sequential wizard form.
+  """
+  fields: List[FieldSpec]
+  max_forms: int = 5
 
-    def cardinalities(self) -> List[int]:
-        return [len(f.allowed_controls()) for f in self.fields]
+  def control_dim(self) -> int:
+    return len(self.fields)
 
-    def round_to_valid(self, x: np.ndarray) -> List[int]:
-        # x is real vector; map to valid integer index per field
-        rounded: List[int] = []
-        for i, f in enumerate(self.fields):
-            k = len(f.allowed_controls())
-            xi = int(round(clamp(x[i], 0, k - 1)))
-            rounded.append(xi)
-        return rounded
+  def partition_dim(self) -> int:
+    return max(1, self.max_forms)
 
-    def random_vector(self) -> np.ndarray:
-        return np.array([random.uniform(0, len(f.allowed_controls()) - 1) for f in self.fields], dtype=float)
+  def dimension(self) -> int:
+    return self.control_dim() + self.partition_dim()
 
-    def all_controls(self, discrete_indexes: List[int]) -> List[ControlType]:
-        result: List[ControlType] = []
-        for idx, f in zip(discrete_indexes, self.fields):
-            allowed = f.allowed_controls()
-            result.append(allowed[int(idx)])
-        return result
+  def cardinalities(self) -> List[int]:
+    return [len(f.allowed_controls()) for f in self.fields]
+
+  def _partition_counts_from_genome(self, x: np.ndarray) -> List[int]:
+    """Decode Part 2 into integer counts per form that sum to D."""
+    d = self.control_dim()
+    n = self.partition_dim()
+    if n <= 1:
+      return [d]
+    start = d
+    weights = np.array(
+      [max(0.0, float(x[start + i])) for i in range(n)],
+      dtype=float,
+    )
+    if float(weights.sum()) <= 0.0:
+      weights = np.ones(n, dtype=float)
+    exact = weights / weights.sum() * d
+    counts = [int(math.floor(v)) for v in exact]
+    remainder = d - sum(counts)
+    if remainder > 0:
+      fractional = sorted(
+        ((exact[i] - counts[i], i) for i in range(n)),
+        reverse=True,
+      )
+      for k in range(remainder):
+        counts[fractional[k % n][1]] += 1
+    return counts
+
+  def counts_to_form_indices(self, counts: List[int]) -> List[int]:
+    return partition_counts_to_form_indices(counts)
+
+  def round_to_valid(self, x: np.ndarray) -> Tuple[List[int], List[int]]:
+    control_rounded: List[int] = []
+    for i, f in enumerate(self.fields):
+      k = len(f.allowed_controls())
+      xi = int(round(clamp(float(x[i]), 0, max(0, k - 1))))
+      control_rounded.append(xi)
+    partition_counts = self._partition_counts_from_genome(x)
+    return control_rounded, partition_counts
+
+  def random_vector(self) -> np.ndarray:
+    d = self.control_dim()
+    controls = [random.uniform(0, len(f.allowed_controls()) - 1) for f in self.fields]
+    partition = [random.uniform(0.1, 1.0) for _ in range(self.partition_dim())]
+    return np.array(controls + partition, dtype=float)
+
+  def decode_layout(self, x: np.ndarray, registry: FunctionRegistry) -> InterfaceLayout:
+    del registry  # layout decode is registry-independent; kept for a uniform API
+    control_idx, partition_counts = self.round_to_valid(x)
+    controls = self.all_controls(control_idx)
+    return build_interface_layout_from_partition(self.fields, controls, partition_counts)
+
+  def all_controls(self, discrete_indexes: List[int]) -> List[ControlType]:
+    result: List[ControlType] = []
+    for idx, f in zip(discrete_indexes, self.fields):
+      allowed = f.allowed_controls()
+      result.append(allowed[int(idx)])
+    return result
 
 
 class ObjectiveEvaluator:
-    def __init__(self, registry: FunctionRegistry, weights: Tuple[float, float, float]) -> None:
-        self.registry = registry
-        self.weights = weights
+  def __init__(self, registry: FunctionRegistry, profile: TargetProfile) -> None:
+    self.registry = registry
+    self.profile = profile
 
-    def evaluate_controls(self, controls: List[ControlType], fields: List[FieldSpec]) -> List[ScoreTriple]:
-        triples: List[ScoreTriple] = []
-        for control, field in zip(controls, fields):
-            triples.append(self.registry.evaluate(control, field.data_type, field.size))
-        return triples
+  def evaluate_layout(self, layout: InterfaceLayout) -> EfficiencyTriple:
+    return compute_total_efficiency(layout, self.registry)
 
-    def scalar_fitness(self, controls: List[ControlType], fields: List[FieldSpec]) -> float:
-        triples = self.evaluate_controls(controls, fields)
-        return weighted_score(triples, self.weights)
+  def multi_objective(self, layout: InterfaceLayout) -> Tuple[float, float, float]:
+    return triple_to_objective_tuple(self.evaluate_layout(layout))
 
-    def multi_objective(self, controls: List[ControlType], fields: List[FieldSpec]) -> ScoreTriple:
-        triples = self.evaluate_controls(controls, fields)
-        return sum_objectives(triples)
+  def scalar_fitness(self, layout: InterfaceLayout) -> float:
+    triple = self.evaluate_layout(layout)
+    return scalar_fitness_from_triple(triple, self.profile)
+
+  def evaluate_vector(self, x: np.ndarray, space: DecisionSpace) -> EfficiencyTriple:
+    layout = space.decode_layout(x, self.registry)
+    return self.evaluate_layout(layout)
 
 
 def non_dominated_sort(points: List[Tuple[float, float, float]]) -> List[List[int]]:
-    # Higher is better (maximize). NSGA-II typically assumes minimization; invert if needed
-    N = len(points)
-    S = [set() for _ in range(N)]
-    n = [0] * N
-    ranks = [None] * N
-    fronts: List[List[int]] = []
+  n_pop = len(points)
+  s_sets = [set() for _ in range(n_pop)]
+  domination_count = [0] * n_pop
+  ranks: List[Optional[int]] = [None] * n_pop
+  fronts: List[List[int]] = []
 
-    def dominates(p, q) -> bool:
-        return all(p[i] >= q[i] for i in range(3)) and any(p[i] > q[i] for i in range(3))
+  def dominates(p: Tuple[float, float, float], q: Tuple[float, float, float]) -> bool:
+    return all(p[i] >= q[i] for i in range(3)) and any(p[i] > q[i] for i in range(3))
 
-    for p in range(N):
-        for q in range(N):
-            if p == q:
-                continue
-            if dominates(points[p], points[q]):
-                S[p].add(q)
-            elif dominates(points[q], points[p]):
-                n[p] += 1
-        if n[p] == 0:
-            ranks[p] = 0
-    front0 = [i for i in range(N) if ranks[i] == 0]
-    if front0:
-        fronts.append(front0)
+  for p in range(n_pop):
+    for q in range(n_pop):
+      if p == q:
+        continue
+      if dominates(points[p], points[q]):
+        s_sets[p].add(q)
+      elif dominates(points[q], points[p]):
+        domination_count[p] += 1
+    if domination_count[p] == 0:
+      ranks[p] = 0
+  front0 = [i for i in range(n_pop) if ranks[i] == 0]
+  if front0:
+    fronts.append(front0)
 
-    i = 0
-    while i < len(fronts):
-        next_front: List[int] = []
-        for p in fronts[i]:
-            for q in S[p]:
-                n[q] -= 1
-                if n[q] == 0:
-                    ranks[q] = i + 1
-                    next_front.append(q)
-        if next_front:
-            fronts.append(next_front)
-        i += 1
-    return fronts
+  i = 0
+  while i < len(fronts):
+    next_front: List[int] = []
+    for p in fronts[i]:
+      for q in s_sets[p]:
+        domination_count[q] -= 1
+        if domination_count[q] == 0:
+          ranks[q] = i + 1
+          next_front.append(q)
+    if next_front:
+      fronts.append(next_front)
+    i += 1
+  return fronts
 
 
-def crowding_distance(front_points: List[Tuple[float, float, float]], front_indexes: List[int]) -> Dict[int, float]:
-    # Higher is better
-    M = 3
-    l = len(front_indexes)
-    if l == 0:
-        return {}
-    distance: Dict[int, float] = {idx: 0.0 for idx in front_indexes}
-    F = np.array(front_points, dtype=float)
-    for m in range(M):
-        order = np.argsort(F[:, m])
-        min_m = F[order[0], m]
-        max_m = F[order[-1], m]
-        distance[front_indexes[order[0]]] = float("inf")
-        distance[front_indexes[order[-1]]] = float("inf")
-        span = max(1e-9, max_m - min_m)
-        for i in range(1, l - 1):
-            prev_val = F[order[i - 1], m]
-            next_val = F[order[i + 1], m]
-            distance[front_indexes[order[i]]] += (next_val - prev_val) / span
-    return distance
+def crowding_distance(
+  front_points: List[Tuple[float, float, float]],
+  front_indexes: List[int],
+) -> Dict[int, float]:
+  m = 3
+  length = len(front_indexes)
+  if length == 0:
+    return {}
+  distance: Dict[int, float] = {idx: 0.0 for idx in front_indexes}
+  f_arr = np.array(front_points, dtype=float)
+  for dim in range(m):
+    order = np.argsort(f_arr[:, dim])
+    min_m = f_arr[order[0], dim]
+    max_m = f_arr[order[-1], dim]
+    distance[front_indexes[order[0]]] = float("inf")
+    distance[front_indexes[order[-1]]] = float("inf")
+    span = max(1e-9, max_m - min_m)
+    for k in range(1, length - 1):
+      prev_val = f_arr[order[k - 1], dim]
+      next_val = f_arr[order[k + 1], dim]
+      distance[front_indexes[order[k]]] += (next_val - prev_val) / span
+  return distance
 
 
 def nsga2(
-    space: DecisionSpace,
-    evaluator: ObjectiveEvaluator,
-    pop_size: int = 40,
-    generations: int = 40,
-    crossover_prob: float = 0.9,
-    mutation_prob: float = 0.2,
-    mutation_sigma: float = 0.5,
-    random_seed: int | None = None,
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  pop_size: int = 40,
+  generations: int = 40,
+  crossover_prob: float = 0.9,
+  mutation_prob: float = 0.2,
+  mutation_sigma: float = 0.5,
+  random_seed: int | None = None,
 ):
-    if random_seed is not None:
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
 
-    D = len(space.fields)
+  d = space.dimension()
 
-    def evaluate_population(pop: List[np.ndarray]) -> List[Tuple[float, float, float]]:
-        objs: List[Tuple[float, float, float]] = []
-        for x in pop:
-            discrete = space.round_to_valid(x)
-            controls = space.all_controls(discrete)
-            objs.append(evaluator.multi_objective(controls, space.fields))
-        return objs
+  def evaluate_population(pop: List[np.ndarray]) -> List[Tuple[float, float, float]]:
+    return [evaluator.multi_objective(space.decode_layout(x, evaluator.registry)) for x in pop]
 
-    # Initialize population uniformly at random
-    population = [space.random_vector() for _ in range(pop_size)]
-    objectives = evaluate_population(population)
-    history_best_scalar: List[float] = []
-    history_best_mapping: List[int] | None = None
-    history_best_controls: List[ControlType] | None = None
+  population = [space.random_vector() for _ in range(pop_size)]
+  objectives = evaluate_population(population)
+  history_best_scalar: List[float] = []
+  history_best_triple: List[EfficiencyTriple] = []
+  best_layout: Optional[InterfaceLayout] = None
 
-    for g in range(generations):
-        # Create offspring via tournament selection, simulated binary crossover, gaussian mutation
-        offspring: List[np.ndarray] = []
-        while len(offspring) < pop_size:
-            def tournament_select(k: int = 2) -> np.ndarray:
-                candidates = random.sample(range(pop_size), k)
-                # selection based on rank and crowding distance
-                fronts = non_dominated_sort([objectives[i] for i in candidates])
-                first_front = fronts[0]
-                if len(first_front) == 1:
-                    return population[candidates[first_front[0]]].copy()
-                # crowding among selected
-                cd = crowding_distance([objectives[candidates[i]] for i in first_front], [i for i in first_front])
-                best_index = max(first_front, key=lambda i: cd.get(i, 0.0))
-                return population[candidates[best_index]].copy()
+  for _g in range(generations):
+    offspring: List[np.ndarray] = []
+    while len(offspring) < pop_size:
 
-            p1 = tournament_select()
-            p2 = tournament_select()
-            c1 = p1.copy()
-            c2 = p2.copy()
-            if random.random() < crossover_prob:
-                alpha = np.random.uniform(0.0, 1.0, size=D)
-                c1 = alpha * p1 + (1 - alpha) * p2
-                c2 = alpha * p2 + (1 - alpha) * p1
-            if random.random() < mutation_prob:
-                c1 = c1 + np.random.normal(0, mutation_sigma, size=D)
-            if random.random() < mutation_prob:
-                c2 = c2 + np.random.normal(0, mutation_sigma, size=D)
-            offspring.append(c1)
-            if len(offspring) < pop_size:
-                offspring.append(c2)
+      def tournament_select(k: int = 2) -> np.ndarray:
+        candidates = random.sample(range(pop_size), k)
+        fronts = non_dominated_sort([objectives[i] for i in candidates])
+        first_front = fronts[0]
+        if len(first_front) == 1:
+          return population[candidates[first_front[0]]].copy()
+        cd = crowding_distance(
+          [objectives[candidates[i]] for i in first_front],
+          list(first_front),
+        )
+        best_index = max(first_front, key=lambda i: cd.get(i, 0.0))
+        return population[candidates[best_index]].copy()
 
-        # Combine and select next generation using non-dominated sorting and crowding
-        combined = population + offspring
-        combined_objectives = evaluate_population(combined)
-        fronts = non_dominated_sort(combined_objectives)
-        new_population: List[np.ndarray] = []
-        new_objectives: List[Tuple[float, float, float]] = []
-        for front in fronts:
-            if len(new_population) + len(front) <= pop_size:
-                for i in front:
-                    new_population.append(combined[i])
-                    new_objectives.append(combined_objectives[i])
-            else:
-                # fill remainder by crowding distance
-                front_points = [combined_objectives[i] for i in front]
-                cd = crowding_distance(front_points, front)
-                order = sorted(front, key=lambda i: cd.get(i, 0.0), reverse=True)
-                slots = pop_size - len(new_population)
-                for i in order[:slots]:
-                    new_population.append(combined[i])
-                    new_objectives.append(combined_objectives[i])
-                break
-        population = new_population
-        objectives = new_objectives
+      p1 = tournament_select()
+      p2 = tournament_select()
+      c1 = p1.copy()
+      c2 = p2.copy()
+      if random.random() < crossover_prob:
+        alpha = np.random.uniform(0.0, 1.0, size=d)
+        c1 = alpha * p1 + (1 - alpha) * p2
+        c2 = alpha * p2 + (1 - alpha) * p1
+      if random.random() < mutation_prob:
+        c1 = c1 + np.random.normal(0, mutation_sigma, size=d)
+      if random.random() < mutation_prob:
+        c2 = c2 + np.random.normal(0, mutation_sigma, size=d)
+      offspring.append(c1)
+      if len(offspring) < pop_size:
+        offspring.append(c2)
 
-        # Track best by weighted scalar for comparison
-        best_scalar = -1.0
-        best_controls: List[ControlType] | None = None
-        for x in population:
-            discrete = space.round_to_valid(x)
-            controls = space.all_controls(discrete)
-            scalar = evaluator.scalar_fitness(controls, space.fields)
-            if scalar > best_scalar:
-                best_scalar = scalar
-                best_controls = controls
-        history_best_scalar.append(best_scalar)
-        if best_controls is not None:
-            history_best_controls = best_controls
-            history_best_mapping = space.round_to_valid(population[0])
+    combined = population + offspring
+    combined_objectives = evaluate_population(combined)
+    fronts = non_dominated_sort(combined_objectives)
+    new_population: List[np.ndarray] = []
+    new_objectives: List[Tuple[float, float, float]] = []
+    for front in fronts:
+      if len(new_population) + len(front) <= pop_size:
+        for i in front:
+          new_population.append(combined[i])
+          new_objectives.append(combined_objectives[i])
+      else:
+        front_points = [combined_objectives[i] for i in front]
+        cd = crowding_distance(front_points, front)
+        order = sorted(front, key=lambda i: cd.get(i, 0.0), reverse=True)
+        slots = pop_size - len(new_population)
+        for i in order[:slots]:
+          new_population.append(combined[i])
+          new_objectives.append(combined_objectives[i])
+        break
+    population = new_population
+    objectives = new_objectives
 
-    return {
-        "best_score": history_best_scalar[-1] if history_best_scalar else 0.0,
-        "history": history_best_scalar,
-        "best_controls": history_best_controls,
-    }
+    front0 = non_dominated_sort(objectives)[0] if objectives else [0]
+    triples = [
+      EfficiencyTriple(*objectives[i])
+      for i in front0
+    ]
+    pick = select_from_pareto(triples, evaluator.profile)
+    chosen_index = front0[pick]
+    best_layout = space.decode_layout(population[chosen_index], evaluator.registry)
+    best_triple = EfficiencyTriple(*objectives[chosen_index])
+    history_best_scalar.append(
+      scalar_fitness_from_triple(best_triple, evaluator.profile)
+    )
+    history_best_triple.append(best_triple)
+
+  if best_layout is None and population:
+    best_layout = space.decode_layout(population[0], evaluator.registry)
+
+  return {
+    "best_score": history_best_scalar[-1] if history_best_scalar else 0.0,
+    "history": history_best_scalar,
+    "best_controls": best_layout.controls_flat() if best_layout else None,
+    "best_layout": best_layout,
+    "best_triple": history_best_triple[-1] if history_best_triple else EfficiencyTriple.identity(),
+  }
 
 
-def hill_climb(space: DecisionSpace, evaluator: ObjectiveEvaluator, iterations: int = 200, random_seed: int | None = None):
-    if random_seed is not None:
-        random.seed(random_seed)
-        np.random.seed(random_seed)
-
-    # Start from random discrete solution
-    current = space.round_to_valid(space.random_vector())
-    current_controls = space.all_controls(current)
-    current_score = evaluator.scalar_fitness(current_controls, space.fields)
-    history = [current_score]
-
-    for _ in range(iterations):
-        improved = False
-        for i, field in enumerate(space.fields):
-            best_local = current[i]
-            best_local_score = current_score
-            for idx in range(len(field.allowed_controls())):
-                if idx == current[i]:
-                    continue
-                candidate = list(current)
-                candidate[i] = idx
-                candidate_controls = space.all_controls(candidate)
-                score = evaluator.scalar_fitness(candidate_controls, space.fields)
-                if score > best_local_score:
-                    best_local_score = score
-                    best_local = idx
-                    improved = True
-            current[i] = best_local
-            current_controls = space.all_controls(current)
-            current_score = evaluator.scalar_fitness(current_controls, space.fields)
-        history.append(current_score)
-        if not improved:
-            break
-
-    return {"best_score": current_score, "history": history, "best_controls": current_controls}
+def _vector_to_layout(space: DecisionSpace, evaluator: ObjectiveEvaluator, x: np.ndarray) -> InterfaceLayout:
+  return space.decode_layout(x, evaluator.registry)
 
 
-def pso(space: DecisionSpace, evaluator: ObjectiveEvaluator, swarm_size: int = 30, iterations: int = 50, inertia: float = 0.7, cognitive: float = 1.5, social: float = 1.5, random_seed: int | None = None):
-    if random_seed is not None:
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+def hill_climb(
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  iterations: int = 200,
+  random_seed: int | None = None,
+):
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
 
-    D = len(space.fields)
-    positions = np.array([space.random_vector() for _ in range(swarm_size)])
-    velocities = np.zeros_like(positions)
-    personal_best_positions = positions.copy()
-    personal_best_scores = np.array([evaluator.scalar_fitness(space.all_controls(space.round_to_valid(p)), space.fields) for p in positions])
-    global_best_index = int(np.argmax(personal_best_scores))
-    global_best_position = personal_best_positions[global_best_index].copy()
-    global_best_score = float(personal_best_scores[global_best_index])
+  current = space.random_vector()
+  current_layout = _vector_to_layout(space, evaluator, current)
+  current_score = evaluator.scalar_fitness(current_layout)
+  history = [current_score]
+  best_layout = current_layout
+  best_score = current_score
 
-    history = [global_best_score]
+  for _ in range(iterations):
+    improved = False
+    d = space.control_dim()
+    for dim in range(space.dimension()):
+      best_local = float(current[dim])
+      best_local_score = current_score
+      if dim < d:
+        span = len(space.fields[dim].allowed_controls()) - 1
+        deltas = (-1, 1)
+      else:
+        span = None
+        deltas = (-0.2, 0.2)
+      for delta in deltas:
+        candidate = current.copy()
+        if span is not None:
+          candidate[dim] = clamp(candidate[dim] + delta, 0, span)
+        else:
+          candidate[dim] = max(0.0, float(candidate[dim]) + delta)
+        layout = _vector_to_layout(space, evaluator, candidate)
+        score = evaluator.scalar_fitness(layout)
+        if score > best_local_score:
+          best_local_score = score
+          best_local = float(candidate[dim])
+          improved = True
+      current[dim] = best_local
+      current_layout = _vector_to_layout(space, evaluator, current)
+      current_score = evaluator.scalar_fitness(current_layout)
+    history.append(current_score)
+    if current_score > best_score:
+      best_score = current_score
+      best_layout = current_layout
+    if not improved:
+      break
 
-    for _ in range(iterations):
-        r1 = np.random.rand(swarm_size, D)
-        r2 = np.random.rand(swarm_size, D)
-        velocities = inertia * velocities + cognitive * r1 * (personal_best_positions - positions) + social * r2 * (global_best_position - positions)
-        positions = positions + velocities
-        # Evaluate
-        for i in range(swarm_size):
-            score = evaluator.scalar_fitness(space.all_controls(space.round_to_valid(positions[i])), space.fields)
-            if score > personal_best_scores[i]:
-                personal_best_scores[i] = score
-                personal_best_positions[i] = positions[i].copy()
-                if score > global_best_score:
-                    global_best_score = score
-                    global_best_position = positions[i].copy()
-        history.append(global_best_score)
-
-    best_controls = space.all_controls(space.round_to_valid(global_best_position))
-    return {"best_score": global_best_score, "history": history, "best_controls": best_controls}
+  return {
+    "best_score": best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat(),
+    "best_layout": best_layout,
+  }
 
 
-def random_search(space: DecisionSpace, evaluator: ObjectiveEvaluator, iterations: int = 200, random_seed: int | None = None):
-    if random_seed is not None:
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+def pso(
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  swarm_size: int = 30,
+  iterations: int = 50,
+  inertia: float = 0.7,
+  cognitive: float = 1.5,
+  social: float = 1.5,
+  random_seed: int | None = None,
+):
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
 
-    best_score = -1.0
-    best_controls: List[ControlType] | None = None
-    history: List[float] = []
-    for _ in range(iterations):
-        candidate = space.round_to_valid(space.random_vector())
-        controls = space.all_controls(candidate)
-        score = evaluator.scalar_fitness(controls, space.fields)
-        if score > best_score:
-            best_score = score
-            best_controls = controls
-        history.append(best_score)
-    return {"best_score": best_score, "history": history, "best_controls": best_controls}
+  d = space.dimension()
+  positions = np.array([space.random_vector() for _ in range(swarm_size)])
+  velocities = np.zeros_like(positions)
+  personal_best_positions = positions.copy()
+  personal_best_scores = np.array(
+    [
+      evaluator.scalar_fitness(_vector_to_layout(space, evaluator, p))
+      for p in positions
+    ]
+  )
+  global_best_index = int(np.argmax(personal_best_scores))
+  global_best_position = personal_best_positions[global_best_index].copy()
+  global_best_score = float(personal_best_scores[global_best_index])
+  history = [global_best_score]
+
+  for _ in range(iterations):
+    r1 = np.random.rand(swarm_size, d)
+    r2 = np.random.rand(swarm_size, d)
+    velocities = (
+      inertia * velocities
+      + cognitive * r1 * (personal_best_positions - positions)
+      + social * r2 * (global_best_position - positions)
+    )
+    positions = positions + velocities
+    for i in range(swarm_size):
+      layout = _vector_to_layout(space, evaluator, positions[i])
+      score = evaluator.scalar_fitness(layout)
+      if score > personal_best_scores[i]:
+        personal_best_scores[i] = score
+        personal_best_positions[i] = positions[i].copy()
+        if score > global_best_score:
+          global_best_score = score
+          global_best_position = positions[i].copy()
+    history.append(global_best_score)
+
+  best_layout = _vector_to_layout(space, evaluator, global_best_position)
+  return {
+    "best_score": global_best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat(),
+    "best_layout": best_layout,
+  }
+
+
+def random_search(
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  iterations: int = 200,
+  random_seed: int | None = None,
+):
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+
+  best_score = -1.0
+  best_layout: Optional[InterfaceLayout] = None
+  history: List[float] = []
+  for _ in range(iterations):
+    candidate = space.random_vector()
+    layout = _vector_to_layout(space, evaluator, candidate)
+    score = evaluator.scalar_fitness(layout)
+    if score > best_score:
+      best_score = score
+      best_layout = layout
+    history.append(best_score)
+  return {
+    "best_score": best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat() if best_layout else None,
+    "best_layout": best_layout,
+  }
 
 
 def greedy(space: DecisionSpace, evaluator: ObjectiveEvaluator) -> Dict[str, object]:
-    """
-    Поскольку итоговый скор есть среднее по полям, оптимальный по этому критерию
-    контроль для каждого поля можно выбрать независимо.
-    """
-    chosen_controls: List[ControlType] = []
-    per_field_scores: List[float] = []
-    for field in space.fields:
-        best_idx = 0
-        best_score = -1.0
-        for idx, ctrl in enumerate(field.allowed_controls()):
-            triple = evaluator.registry.evaluate(ctrl, field.data_type, field.size)
-            score = float(np.dot(np.array(triple, dtype=float), np.array(evaluator.weights)))
-            if score > best_score:
-                best_score = score
-                best_idx = idx
-        chosen_controls.append(field.allowed_controls()[best_idx])
-        per_field_scores.append(best_score)
-    overall = float(np.mean(per_field_scores)) if per_field_scores else 0.0
-    return {"best_score": overall, "history": [overall], "best_controls": chosen_controls}
+  control_idx = [0] * len(space.fields)
+  partition_counts = [len(space.fields)] + [0] * (space.partition_dim() - 1)
+  controls = space.all_controls(control_idx)
+  form_idx = space.counts_to_form_indices(partition_counts)
+  layout = build_interface_layout(space.fields, controls, form_idx)
+  best_score = evaluator.scalar_fitness(layout)
+
+  for field_i, field in enumerate(space.fields):
+    best_control = control_idx[field_i]
+    best_local = best_score
+    for idx in range(len(field.allowed_controls())):
+      trial_controls = list(control_idx)
+      trial_controls[field_i] = idx
+      trial = space.all_controls(trial_controls)
+      trial_layout = build_interface_layout(space.fields, trial, form_idx)
+      score = evaluator.scalar_fitness(trial_layout)
+      if score > best_local:
+        best_local = score
+        best_control = idx
+    control_idx[field_i] = best_control
+    controls = space.all_controls(control_idx)
+    layout = build_interface_layout(space.fields, controls, form_idx)
+    best_score = evaluator.scalar_fitness(layout)
+
+  d = len(space.fields)
+  improved_partition = True
+  while improved_partition:
+    improved_partition = False
+    for from_form in range(space.partition_dim()):
+      for to_form in range(space.partition_dim()):
+        if from_form == to_form or partition_counts[from_form] <= 0:
+          continue
+        trial_counts = list(partition_counts)
+        trial_counts[from_form] -= 1
+        trial_counts[to_form] += 1
+        if sum(trial_counts) != d:
+          continue
+        trial_form_idx = space.counts_to_form_indices(trial_counts)
+        trial_layout = build_interface_layout(space.fields, controls, trial_form_idx)
+        score = evaluator.scalar_fitness(trial_layout)
+        if score > best_score:
+          best_score = score
+          partition_counts = trial_counts
+          form_idx = trial_form_idx
+          layout = trial_layout
+          improved_partition = True
+
+  return {
+    "best_score": best_score,
+    "history": [best_score],
+    "best_controls": layout.controls_flat(),
+    "best_layout": layout,
+  }
 
 
 def simulated_annealing(
-    space: DecisionSpace,
-    evaluator: ObjectiveEvaluator,
-    iterations: int = 300,
-    initial_temp: float = 5.0,
-    cooling: float = 0.97,
-    random_seed: int | None = None,
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  iterations: int = 300,
+  initial_temp: float = 5.0,
+  cooling: float = 0.97,
+  random_seed: int | None = None,
 ):
-    if random_seed is not None:
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
 
-    current = space.round_to_valid(space.random_vector())
-    current_controls = space.all_controls(current)
-    current_score = evaluator.scalar_fitness(current_controls, space.fields)
-    best_controls = current_controls
-    best_score = current_score
-    history = [best_score]
-    temp = initial_temp
+  current = space.random_vector()
+  current_layout = _vector_to_layout(space, evaluator, current)
+  current_score = evaluator.scalar_fitness(current_layout)
+  best_layout = current_layout
+  best_score = current_score
+  history = [best_score]
+  temp = initial_temp
+  d = space.dimension()
 
-    for _ in range(iterations):
-        i = random.randrange(len(space.fields))
-        field = space.fields[i]
-        candidate_idx = random.randrange(len(field.allowed_controls()))
-        candidate_vec = list(current)
-        candidate_vec[i] = candidate_idx
-        candidate_controls = space.all_controls(candidate_vec)
-        candidate_score = evaluator.scalar_fitness(candidate_controls, space.fields)
-        delta = candidate_score - current_score
-        if delta > 0 or random.random() < math.exp(delta / max(1e-9, temp)):
-            current = candidate_vec
-            current_controls = candidate_controls
-            current_score = candidate_score
-        if current_score > best_score:
-            best_score = current_score
-            best_controls = current_controls
-        history.append(best_score)
-        temp *= cooling
+  control_d = space.control_dim()
+  for _ in range(iterations):
+    dim = random.randrange(d)
+    candidate = current.copy()
+    if dim < control_d:
+      span = len(space.fields[dim].allowed_controls()) - 1
+      candidate[dim] = clamp(candidate[dim] + random.choice([-1.0, 1.0]), 0, span)
+    else:
+      candidate[dim] = max(0.0, float(candidate[dim]) + random.uniform(-0.25, 0.25))
+    candidate_layout = _vector_to_layout(space, evaluator, candidate)
+    candidate_score = evaluator.scalar_fitness(candidate_layout)
+    delta = candidate_score - current_score
+    if delta > 0 or random.random() < math.exp(delta / max(1e-9, temp)):
+      current = candidate
+      current_layout = candidate_layout
+      current_score = candidate_score
+    if current_score > best_score:
+      best_score = current_score
+      best_layout = current_layout
+    history.append(best_score)
+    temp *= cooling
 
-    return {"best_score": best_score, "history": history, "best_controls": best_controls}
+  return {
+    "best_score": best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat(),
+    "best_layout": best_layout,
+  }
 
 
 def tabu_search(
-    space: DecisionSpace,
-    evaluator: ObjectiveEvaluator,
-    iterations: int = 200,
-    tabu_tenure: int = 7,
-    random_seed: int | None = None,
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  iterations: int = 200,
+  tabu_tenure: int = 7,
+  random_seed: int | None = None,
 ):
-    if random_seed is not None:
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
 
-    current = space.round_to_valid(space.random_vector())
-    current_controls = space.all_controls(current)
-    current_score = evaluator.scalar_fitness(current_controls, space.fields)
-    best_controls = current_controls
-    best_score = current_score
-    history = [best_score]
-    tabu_list: List[Tuple[int, int]] = []
+  current = space.random_vector()
+  current_layout = _vector_to_layout(space, evaluator, current)
+  current_score = evaluator.scalar_fitness(current_layout)
+  best_layout = current_layout
+  best_score = current_score
+  history = [best_score]
+  tabu_list: List[Tuple[int, int]] = []
+  control_idx, partition_counts = space.round_to_valid(current)
+  form_idx = space.counts_to_form_indices(partition_counts)
 
-    for _ in range(iterations):
-        best_neighbor: Tuple[List[int], float] | None = None
-        move_used: Tuple[int, int] | None = None
-        for i, field in enumerate(space.fields):
-            for idx in range(len(field.allowed_controls())):
-                if idx == current[i]:
-                    continue
-                move = (i, idx)
-                candidate_vec = list(current)
-                candidate_vec[i] = idx
-                candidate_controls = space.all_controls(candidate_vec)
-                candidate_score = evaluator.scalar_fitness(candidate_controls, space.fields)
-                is_tabu = move in tabu_list
-                aspiration = candidate_score > best_score
-                if is_tabu and not aspiration:
-                    continue
-                if best_neighbor is None or candidate_score > best_neighbor[1]:
-                    best_neighbor = (candidate_vec, candidate_score)
-                    move_used = move
-        if best_neighbor is None:
-            break
-        current = best_neighbor[0]
-        current_controls = space.all_controls(current)
-        current_score = best_neighbor[1]
-        if move_used:
-            tabu_list.append(move_used)
-            if len(tabu_list) > tabu_tenure:
-                tabu_list.pop(0)
-        if current_score > best_score:
-            best_score = current_score
-            best_controls = current_controls
-        history.append(best_score)
+  for _ in range(iterations):
+    best_neighbor: Tuple[List[int], List[int], float] | None = None
+    move_used: Tuple[int, int] | None = None
+    for i, field in enumerate(space.fields):
+      for idx in range(len(field.allowed_controls())):
+        if idx == control_idx[i]:
+          continue
+        move = (i, idx)
+        trial_controls = list(control_idx)
+        trial_controls[i] = idx
+        trial = space.all_controls(trial_controls)
+        layout = build_interface_layout(space.fields, trial, form_idx)
+        score = evaluator.scalar_fitness(layout)
+        if move in tabu_list and score <= best_score:
+          continue
+        if best_neighbor is None or score > best_neighbor[2]:
+          best_neighbor = (trial_controls, partition_counts, score)
+          move_used = move
+    for from_form in range(space.partition_dim()):
+      for to_form in range(space.partition_dim()):
+        if from_form == to_form or partition_counts[from_form] <= 0:
+          continue
+        move = (1000 + from_form, to_form)
+        trial_counts = list(partition_counts)
+        trial_counts[from_form] -= 1
+        trial_counts[to_form] += 1
+        trial_form_idx = space.counts_to_form_indices(trial_counts)
+        layout = build_interface_layout(
+          space.fields,
+          space.all_controls(control_idx),
+          trial_form_idx,
+        )
+        score = evaluator.scalar_fitness(layout)
+        if move in tabu_list and score <= best_score:
+          continue
+        if best_neighbor is None or score > best_neighbor[2]:
+          best_neighbor = (control_idx, trial_counts, score)
+          move_used = move
+    if best_neighbor is None:
+      break
+    control_idx, partition_counts = best_neighbor[0], best_neighbor[1]
+    form_idx = space.counts_to_form_indices(partition_counts)
+    current_score = best_neighbor[2]
+    current_layout = build_interface_layout(space.fields, space.all_controls(control_idx), form_idx)
+    if move_used:
+      tabu_list.append(move_used)
+      if len(tabu_list) > tabu_tenure:
+        tabu_list.pop(0)
+    if current_score > best_score:
+      best_score = current_score
+      best_layout = current_layout
+    history.append(best_score)
 
-    return {"best_score": best_score, "history": history, "best_controls": best_controls}
+  return {
+    "best_score": best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat(),
+    "best_layout": best_layout,
+  }
 
 
 def aco(
-    space: DecisionSpace,
-    evaluator: ObjectiveEvaluator,
-    ants: int = 20,
-    iterations: int = 40,
-    alpha: float = 1.0,
-    beta: float = 2.0,
-    evaporation: float = 0.1,
-    deposit_weight: float = 1.0,
-    random_seed: int | None = None,
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  ants: int = 20,
+  iterations: int = 40,
+  alpha: float = 1.0,
+  beta: float = 2.0,
+  evaporation: float = 0.1,
+  deposit_weight: float = 1.0,
+  random_seed: int | None = None,
 ):
-    if random_seed is not None:
-        random.seed(random_seed)
-        np.random.seed(random_seed)
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
 
-    num_fields = len(space.fields)
-    allowed = [field.allowed_controls() for field in space.fields]
-    max_controls = max(len(c) for c in allowed) if allowed else 0
-    pheromone = np.ones((num_fields, max_controls), dtype=float)
+  num_fields = len(space.fields)
+  allowed = [field.allowed_controls() for field in space.fields]
+  max_controls = max(len(c) for c in allowed) if allowed else 0
+  pheromone = np.ones((num_fields, max_controls), dtype=float)
+  heuristic = np.zeros_like(pheromone)
+  for i, field in enumerate(space.fields):
+    for j, ctrl in enumerate(allowed[i]):
+      trial = [0] * num_fields
+      trial[i] = j
+      counts = [num_fields] + [0] * (space.partition_dim() - 1)
+      layout = build_interface_layout(
+        space.fields,
+        space.all_controls(trial),
+        space.counts_to_form_indices(counts),
+      )
+      heuristic[i, j] = evaluator.scalar_fitness(layout)
 
-    # эвристика: локальный скор конкретного контрола для поля
-    heuristic = np.zeros_like(pheromone)
-    for i, field in enumerate(space.fields):
-        for j, ctrl in enumerate(allowed[i]):
-            triple = evaluator.registry.evaluate(ctrl, field.data_type, field.size)
-            heuristic[i, j] = float(np.dot(np.array(triple, dtype=float), np.array(evaluator.weights)))
+  best_layout: Optional[InterfaceLayout] = None
+  best_score = -1.0
+  history: List[float] = []
 
-    best_controls: List[ControlType] | None = None
-    best_score = -1.0
-    history: List[float] = []
+  for _ in range(iterations):
+    iteration_best = -1.0
+    iteration_best_layout: Optional[InterfaceLayout] = None
+    for _ant in range(ants):
+      chosen_indexes: List[int] = []
+      for i in range(num_fields):
+        options = len(allowed[i])
+        tau = pheromone[i, :options] ** alpha
+        eta = heuristic[i, :options] ** beta
+        probs = tau * eta
+        if np.sum(probs) <= 0:
+          probs = np.ones_like(probs)
+        probs = probs / np.sum(probs)
+        idx = int(np.random.choice(np.arange(options), p=probs))
+        chosen_indexes.append(idx)
+      partition_vec = np.array(
+        [random.uniform(0.1, 1.0) for _ in range(space.partition_dim())],
+        dtype=float,
+      )
+      genome = np.concatenate(
+        [
+          np.array(chosen_indexes, dtype=float),
+          partition_vec,
+        ]
+      )
+      layout = space.decode_layout(genome, evaluator.registry)
+      score = evaluator.scalar_fitness(layout)
+      if score > iteration_best:
+        iteration_best = score
+        iteration_best_layout = layout
+    pheromone *= 1.0 - evaporation
+    if iteration_best_layout is not None:
+      for i, ctrl in enumerate(iteration_best_layout.controls_flat()):
+        idx = allowed[i].index(ctrl)
+        pheromone[i, idx] += deposit_weight * iteration_best
+      if iteration_best > best_score:
+        best_score = iteration_best
+        best_layout = iteration_best_layout
+    history.append(best_score if best_score >= 0 else iteration_best)
 
-    for _ in range(iterations):
-        iteration_best = -1.0
-        iteration_best_controls: List[ControlType] | None = None
-        for _ant in range(ants):
-            chosen_indexes: List[int] = []
-            for i, field in enumerate(space.fields):
-                options = len(allowed[i])
-                tau = pheromone[i, :options] ** alpha
-                eta = heuristic[i, :options] ** beta
-                probs = tau * eta
-                if np.sum(probs) <= 0:
-                    probs = np.ones_like(probs)
-                probs = probs / np.sum(probs)
-                idx = int(np.random.choice(np.arange(options), p=probs))
-                chosen_indexes.append(idx)
-            controls = space.all_controls(chosen_indexes)
-            score = evaluator.scalar_fitness(controls, space.fields)
-            if score > iteration_best:
-                iteration_best = score
-                iteration_best_controls = controls
-        # испарение
-        pheromone *= (1.0 - evaporation)
-        if iteration_best_controls is not None:
-            # усиливаем след по лучшему решению итерации
-            for i, ctrl in enumerate(iteration_best_controls):
-                idx = allowed[i].index(ctrl)
-                pheromone[i, idx] += deposit_weight * iteration_best
-            if iteration_best > best_score:
-                best_score = iteration_best
-                best_controls = iteration_best_controls
-        history.append(best_score if best_score >= 0 else iteration_best)
-
-    return {"best_score": best_score, "history": history, "best_controls": best_controls}
-
-
+  return {
+    "best_score": best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat() if best_layout else None,
+    "best_layout": best_layout,
+  }

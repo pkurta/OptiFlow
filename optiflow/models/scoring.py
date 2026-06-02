@@ -1,348 +1,53 @@
 from __future__ import annotations
-
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Callable, Dict, List, Tuple
-
+from enum import Enum
+from typing import List, Tuple, Dict
 
 class DataType(Enum):
-    NUMBER = auto()
-    SHORT_TEXT = auto()
-    LONG_TEXT = auto()
-    BOOLEAN = auto()
-    DATE_TIME = auto()
-    COLOR = auto()
-    CATEGORY = auto()
-    MULTI_CATEGORY = auto()
-    RICH_TEXT = auto()
-    LIST = auto()
-    TREE = auto()
-    GRID = auto()
-    FILE = auto()
-    IMAGE = auto()
-
+    BOOLEAN = "BOOLEAN"
+    UNSIGNED = "UNSIGNED"
+    TEXT = "TEXT"
 
 class ControlType(Enum):
-    # Text inputs
-    INPUT = auto()
-    TEXTAREA = auto()
-    PASSWORD = auto()
-    SEARCH = auto()
-    MASKED_INPUT = auto()
+    TEXTBOX = "TEXTBOX"
+    DROPDOWNLIST = "DROPDOWNLIST"
+    CHECKBOX = "CHECKBOX"
+    SPINNER = "SPINNER"
+    SLIDER = "SLIDER"
+    TEXTBOX_RO = "TEXTBOX_RO"
 
-    # Selection
-    CHECKBOX = auto()
-    RADIO = auto()
-    TOGGLE = auto()
-    SELECT = auto()
-    COMBOBOX = auto()
-    SLIDER = auto()
-    DATETIME_PICKER = auto()
-    COLOR_PICKER = auto()
+def _clip(val: float) -> float:
+    return max(0.0, min(1.0, float(val)))
 
-    # Buttons
-    BUTTON = auto()
-    ICON_BUTTON = auto()
-    FAB = auto()
-    TOGGLE_BUTTON = auto()
+@dataclass(frozen=True)
+class EfficiencyTriple:
+    potency: float
+    operativeness: float
+    resource_saving: float
 
-    # Display
-    TABLE = auto()
-    LIST = auto()
-    TREE_VIEW = auto()
-    GRID = auto()
-    CHART = auto()
-    CAROUSEL = auto()
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "potency", _clip(self.potency))
+        object.__setattr__(self, "operativeness", _clip(self.operativeness))
+        object.__setattr__(self, "resource_saving", _clip(self.resource_saving))
 
-    # Special
-    RICH_TEXT_EDITOR = auto()
+    def __mul__(self, other: EfficiencyTriple) -> EfficiencyTriple:
+        if not isinstance(other, EfficiencyTriple):
+            return NotImplemented
+        return EfficiencyTriple(
+            self.potency * other.potency,
+            self.operativeness * other.operativeness,
+            self.resource_saving * other.resource_saving,
+        )
 
+    def __rmul__(self, other: EfficiencyTriple) -> EfficiencyTriple:
+        return self.__mul__(other)
 
-ScoreTriple = Tuple[float, float, float]
+    @classmethod
+    def identity(cls) -> EfficiencyTriple:
+        return cls(1.0, 1.0, 1.0)
 
-
-def _clip(v: float) -> float:
-    return max(0.0, min(1.0, float(v)))
-
-
-def _normalize(triple: ScoreTriple) -> ScoreTriple:
-    return (_clip(triple[0]), _clip(triple[1]), _clip(triple[2]))
-
-
-DEFAULT_FUNCTIONS: Dict[ControlType, str] = {
-    ControlType.INPUT: (
-        """
-def score(t, n):
-    # Simple single-line text input
-    if t in ("NUMBER", "SHORT_TEXT", "SEARCH") and n <= 32:
-        return 0.85, 0.90, 0.85
-    if t == "NUMBER" and n <= 8:
-        return 0.80, 0.92, 0.88
-    if t == "SHORT_TEXT" and n <= 128:
-        return 0.75, 0.85, 0.80
-    return 0.40, 0.70, 0.95
-        """
-    ),
-    ControlType.TEXTAREA: (
-        """
-def score(t, n):
-    if t in ("LONG_TEXT", "RICH_TEXT") or n > 128:
-        return 0.92, 0.70, 0.65
-    if t == "SHORT_TEXT" and 64 <= n <= 256:
-        return 0.80, 0.75, 0.70
-    return 0.50, 0.65, 0.85
-        """
-    ),
-    ControlType.PASSWORD: (
-        """
-def score(t, n):
-    if t == "SHORT_TEXT" and n <= 64:
-        return 0.78, 0.85, 0.82
-    return 0.40, 0.70, 0.90
-        """
-    ),
-    ControlType.SEARCH: (
-        """
-def score(t, n):
-    if t in ("SHORT_TEXT", "SEARCH") and n <= 64:
-        return 0.85, 0.92, 0.82
-    return 0.45, 0.75, 0.90
-        """
-    ),
-    ControlType.MASKED_INPUT: (
-        """
-def score(t, n):
-    if t == "SHORT_TEXT" and n <= 32:
-        return 0.82, 0.82, 0.80
-    if t == "NUMBER" and n <= 16:
-        return 0.80, 0.80, 0.82
-    return 0.45, 0.70, 0.90
-        """
-    ),
-    ControlType.CHECKBOX: (
-        """
-def score(t, n):
-    if t == "BOOLEAN":
-        return 0.95, 0.95, 0.95
-    return 0.30, 0.85, 0.98
-        """
-    ),
-    ControlType.RADIO: (
-        """
-def score(t, n):
-    if t == "CATEGORY" and n <= 6:
-        return 0.85, 0.82, 0.70
-    return 0.45, 0.75, 0.88
-        """
-    ),
-    ControlType.TOGGLE: (
-        """
-def score(t, n):
-    if t == "BOOLEAN":
-        return 0.92, 0.92, 0.92
-    if t == "CATEGORY" and n == 2:
-        return 0.80, 0.88, 0.85
-    return 0.35, 0.80, 0.95
-        """
-    ),
-    ControlType.SELECT: (
-        """
-def score(t, n):
-    if t in ("CATEGORY", "MULTI_CATEGORY") and n >= 5:
-        return 0.82, 0.78, 0.78
-    return 0.60, 0.72, 0.85
-        """
-    ),
-    ControlType.COMBOBOX: (
-        """
-def score(t, n):
-    if t in ("CATEGORY", "SHORT_TEXT") and n >= 10:
-        return 0.80, 0.80, 0.75
-    return 0.60, 0.70, 0.85
-        """
-    ),
-    ControlType.SLIDER: (
-        """
-def score(t, n):
-    if t == "NUMBER" and n <= 4:
-        return 0.88, 0.90, 0.80
-    if t == "NUMBER" and n <= 8:
-        return 0.80, 0.85, 0.82
-    return 0.50, 0.70, 0.88
-        """
-    ),
-    ControlType.DATETIME_PICKER: (
-        """
-def score(t, n):
-    if t == "DATE_TIME":
-        return 0.92, 0.88, 0.78
-    return 0.40, 0.70, 0.90
-        """
-    ),
-    ControlType.COLOR_PICKER: (
-        """
-def score(t, n):
-    if t == "COLOR":
-        return 0.95, 0.90, 0.80
-    return 0.35, 0.70, 0.92
-        """
-    ),
-    ControlType.BUTTON: (
-        """
-def score(t, n):
-    return 0.70, 0.90, 0.85
-        """
-    ),
-    ControlType.ICON_BUTTON: (
-        """
-def score(t, n):
-    return 0.72, 0.92, 0.84
-        """
-    ),
-    ControlType.FAB: (
-        """
-def score(t, n):
-    return 0.68, 0.88, 0.80
-        """
-    ),
-    ControlType.TOGGLE_BUTTON: (
-        """
-def score(t, n):
-    if t == "BOOLEAN":
-        return 0.88, 0.90, 0.86
-    return 0.55, 0.80, 0.88
-        """
-    ),
-    ControlType.TABLE: (
-        """
-def score(t, n):
-    if t in ("GRID", "LIST") or n >= 50:
-        return 0.88, 0.70, 0.60
-    return 0.60, 0.65, 0.75
-        """
-    ),
-    ControlType.LIST: (
-        """
-def score(t, n):
-    if t in ("LIST", "CATEGORY") and n <= 100:
-        return 0.80, 0.78, 0.70
-    return 0.60, 0.70, 0.80
-        """
-    ),
-    ControlType.TREE_VIEW: (
-        """
-def score(t, n):
-    if t == "TREE":
-        return 0.90, 0.70, 0.60
-    return 0.50, 0.65, 0.78
-        """
-    ),
-    ControlType.GRID: (
-        """
-def score(t, n):
-    if t in ("GRID", "IMAGE"):
-        return 0.82, 0.72, 0.68
-    return 0.55, 0.68, 0.78
-        """
-    ),
-    ControlType.CHART: (
-        """
-def score(t, n):
-    if t in ("NUMBER", "GRID", "LIST") and n >= 20:
-        return 0.85, 0.65, 0.60
-    return 0.50, 0.60, 0.75
-        """
-    ),
-    ControlType.CAROUSEL: (
-        """
-def score(t, n):
-    if t in ("IMAGE", "FILE"):
-        return 0.78, 0.70, 0.68
-    return 0.45, 0.62, 0.80
-        """
-    ),
-    ControlType.RICH_TEXT_EDITOR: (
-        """
-def score(t, n):
-    if t in ("RICH_TEXT", "LONG_TEXT"):
-        return 0.90, 0.65, 0.55
-    return 0.40, 0.60, 0.75
-        """
-    ),
-}
-
-
-def data_type_to_allowed_controls(data_type: DataType) -> List[ControlType]:
-    mapping: Dict[DataType, List[ControlType]] = {
-        DataType.NUMBER: [ControlType.INPUT, ControlType.SLIDER, ControlType.SELECT, ControlType.COMBOBOX, ControlType.CHART],
-        DataType.SHORT_TEXT: [ControlType.INPUT, ControlType.SEARCH, ControlType.PASSWORD, ControlType.MASKED_INPUT, ControlType.COMBOBOX],
-        DataType.LONG_TEXT: [ControlType.TEXTAREA, ControlType.RICH_TEXT_EDITOR],
-        DataType.BOOLEAN: [ControlType.CHECKBOX, ControlType.TOGGLE, ControlType.TOGGLE_BUTTON],
-        DataType.DATE_TIME: [ControlType.DATETIME_PICKER, ControlType.INPUT],
-        DataType.COLOR: [ControlType.COLOR_PICKER],
-        DataType.CATEGORY: [ControlType.SELECT, ControlType.RADIO, ControlType.COMBOBOX, ControlType.LIST],
-        DataType.MULTI_CATEGORY: [ControlType.SELECT, ControlType.COMBOBOX, ControlType.LIST],
-        DataType.RICH_TEXT: [ControlType.RICH_TEXT_EDITOR, ControlType.TEXTAREA],
-        DataType.LIST: [ControlType.LIST, ControlType.TABLE, ControlType.CHART],
-        DataType.TREE: [ControlType.TREE_VIEW],
-        DataType.GRID: [ControlType.TABLE, ControlType.GRID, ControlType.CHART],
-        DataType.FILE: [ControlType.CAROUSEL, ControlType.TABLE],
-        DataType.IMAGE: [ControlType.CAROUSEL, ControlType.GRID, ControlType.TABLE],
-    }
-    return mapping.get(data_type, [ControlType.INPUT])
-
-
-def _safe_env() -> Dict[str, object]:
-    # Safe environment for user functions
-    import math
-
-    return {
-        "abs": abs,
-        "min": min,
-        "max": max,
-        "pow": pow,
-        "round": round,
-        "math": math,
-    }
-
-
-class FunctionRegistry:
-    def __init__(self) -> None:
-        self._code_by_control: Dict[ControlType, str] = dict(DEFAULT_FUNCTIONS)
-        self._compiled_by_control: Dict[ControlType, Callable[[str, int], ScoreTriple]] = {}
-        self._compile_all()
-
-    def _compile_all(self) -> None:
-        for control, code in self._code_by_control.items():
-            self._compiled_by_control[control] = self._compile_function(code)
-
-    def _compile_function(self, code: str) -> Callable[[str, int], ScoreTriple]:
-        local_env: Dict[str, object] = {}
-        global_env = _safe_env()
-        exec(code, global_env, local_env)
-        fn = local_env.get("score")
-        if not callable(fn):
-            raise ValueError("Provided function must define callable 'score(t, n)'")
-
-        def wrapper(data_type_name: str, size: int) -> ScoreTriple:
-            result = fn(data_type_name, int(size))
-            if not isinstance(result, (list, tuple)) or len(result) != 3:
-                raise ValueError("Function must return a tuple (result, speed, economy)")
-            return _normalize((float(result[0]), float(result[1]), float(result[2])))
-
-        return wrapper
-
-    def set_code_for_control(self, control: ControlType, code: str) -> None:
-        self._code_by_control[control] = code
-        self._compiled_by_control[control] = self._compile_function(code)
-
-    def get_code_for_control(self, control: ControlType) -> str:
-        return self._code_by_control[control]
-
-    def evaluate(self, control: ControlType, data_type: DataType, size: int) -> ScoreTriple:
-        func = self._compiled_by_control[control]
-        return func(data_type.name, int(size))
-
+    def as_tuple(self) -> Tuple[float, float, float]:
+        return (self.potency, self.operativeness, self.resource_saving)
 
 @dataclass
 class FieldSpec:
@@ -350,7 +55,188 @@ class FieldSpec:
     data_type: DataType
     size: int
 
-    def allowed_controls(self) -> List[ControlType]:
-        return data_type_to_allowed_controls(self.data_type)
+@dataclass
+class LayoutElement:
+    field_index: int
+    control: ControlType
+    position_index: int  # 1-based index j
 
+@dataclass
+class FormLayout:
+    form_index: int  # 1-based index i
+    elements: List[LayoutElement]
 
+@dataclass
+class InterfaceLayout:
+    forms: List[FormLayout]
+    fields: List[FieldSpec]
+    
+    @property
+    def form_count(self) -> int:
+        return len(self.forms)
+
+def evaluate_form(element_count: int) -> EfficiencyTriple:
+    count = max(0, int(element_count))
+    return EfficiencyTriple(
+        potency=0.999**count,
+        operativeness=0.999**count,
+        resource_saving=0.995**count,
+    )
+
+def partition_counts_to_form_indices(field_counts_per_form: List[int]) -> List[int]:
+    form_indices: List[int] = []
+    for form_i, count in enumerate(field_counts_per_form):
+        form_indices.extend([form_i] * int(count))
+    return form_indices
+
+def build_interface_layout_from_partition(
+    fields: List[FieldSpec],
+    controls: List[ControlType],
+    field_counts_per_form: List[int],
+) -> InterfaceLayout:
+    if len(controls) != len(fields):
+        raise ValueError("controls must match fields length")
+    d = len(fields)
+    counts = [max(0, int(c)) for c in field_counts_per_form]
+    if sum(counts) != d:
+        raise ValueError(f"partition must sum to {d} fields, got {sum(counts)}")
+    form_indices = partition_counts_to_form_indices(counts)
+    return build_interface_layout(fields, controls, form_indices)
+
+def build_interface_layout(
+    fields: List[FieldSpec],
+    controls: List[ControlType],
+    form_indices: List[int],
+) -> InterfaceLayout:
+    forms_dict: Dict[int, List[Tuple[int, ControlType]]] = {}
+    for field_idx, form_idx in enumerate(form_indices):
+        if form_idx not in forms_dict:
+            forms_dict[form_idx] = []
+        forms_dict[form_idx].append((field_idx, controls[field_idx]))
+    
+    sorted_form_keys = sorted(forms_dict.keys())
+    layout_forms: List[FormLayout] = []
+    
+    for dynamic_i, form_key in enumerate(sorted_form_keys, start=1):
+        elements_list: List[LayoutElement] = []
+        for dynamic_j, (f_idx, ctrl) in enumerate(forms_dict[form_key], start=1):
+            elements_list.append(LayoutElement(
+                field_index=f_idx,
+                control=ctrl,
+                position_index=dynamic_j  # Strict 1-based index j
+            ))
+        layout_forms.append(FormLayout(form_index=dynamic_i, elements=elements_list)) # Strict 1-based index i
+        
+    return InterfaceLayout(forms=layout_forms, fields=fields)
+
+class FunctionRegistry:
+    DEFAULT_FUNCTIONS: Dict[ControlType, str] = {
+        ControlType.TEXTBOX: (
+            "if dtype == DataType.TEXT:\n"
+            "    if size < 6:\n"
+            "        p, o, r = 0.92, 0.90, 0.85\n"
+            "    else:\n"
+            "        p, o, r = max(0.4, 0.92 - 0.05 * (size - 5)), 0.75, 0.80\n"
+            "else:\n"
+            "    p, o, r = 0.50, 0.50, 0.50\n"
+        ),
+        ControlType.DROPDOWNLIST: (
+            "if dtype == DataType.TEXT:\n"
+            "    if size > 7:\n"
+            "        p, o, r = 0.88, 0.82, 0.78\n"
+            "    else:\n"
+            "        p, o, r = 0.65, 0.70, 0.85\n"
+            "else:\n"
+            "    p, o, r = 0.50, 0.50, 0.50\n"
+        ),
+        ControlType.CHECKBOX: (
+            "if dtype == DataType.BOOLEAN:\n"
+            "    p, o, r = 0.95, 0.95, 0.95\n"
+            "else:\n"
+            "    p, o, r = 0.50, 0.50, 0.50\n"
+        ),
+        ControlType.SPINNER: (
+            "if dtype == DataType.UNSIGNED:\n"
+            "    if size <= 3:\n"
+            "        p, o, r = 0.85, 0.88, 0.82\n"
+            "    else:\n"
+            "        p, o, r = 0.72, 0.68, 0.80\n"
+            "else:\n"
+            "    p, o, r = 0.50, 0.50, 0.50\n"
+        ),
+        ControlType.SLIDER: (
+            "if dtype == DataType.UNSIGNED:\n"
+            "    if size <= 3:\n"
+            "        p, o, r = 0.85, 0.88, 0.82\n"
+            "    else:\n"
+            "        p, o, r = 0.72, 0.68, 0.80\n"
+            "else:\n"
+            "    p, o, r = 0.50, 0.50, 0.50\n"
+        ),
+        ControlType.TEXTBOX_RO: (
+            "if dtype == DataType.TEXT:\n"
+            "    if size < 6:\n"
+            "        p, o, r = 0.92, 0.90, 0.85\n"
+            "    else:\n"
+            "        p, o, r = max(0.4, 0.92 - 0.05 * (size - 5)), 0.75, 0.80\n"
+            "else:\n"
+            "    p, o, r = 0.50, 0.50, 0.50\n"
+        ),
+    }
+
+    def __init__(self) -> None:
+        self._code_by_control: Dict[ControlType, str] = {
+            ctrl: self.DEFAULT_FUNCTIONS.get(ctrl, "p, o, r = 0.50, 0.50, 0.50")
+            for ctrl in ControlType
+        }
+
+    def get_code_for_control(self, ctrl: ControlType) -> str:
+        return self._code_by_control.get(ctrl, "p, o, r = 0.50, 0.50, 0.50")
+
+    def update_code_for_control(self, ctrl: ControlType, code_str: str) -> bool:
+        compile(code_str, f"<FunctionRegistry:{ctrl.name}>", "exec")
+        self._code_by_control[ctrl] = code_str
+        return True
+
+    # Backward-compatible alias used by FunctionEditor in app.py.
+    def set_code_for_control(self, ctrl: ControlType, code_str: str) -> bool:
+        return self.update_code_for_control(ctrl, code_str)
+
+    def _evaluate_empirical_fallback(self, cls: ControlType, dtype: DataType, size: int) -> EfficiencyTriple:
+        if cls == ControlType.CHECKBOX and dtype == DataType.BOOLEAN:
+            return EfficiencyTriple(0.95, 0.95, 0.95)
+        if cls == ControlType.TEXTBOX and dtype == DataType.TEXT:
+            if size < 6:
+                return EfficiencyTriple(0.92, 0.90, 0.85)
+            return EfficiencyTriple(max(0.4, 0.92 - 0.05 * (size - 5)), 0.75, 0.80)
+        if cls == ControlType.DROPDOWNLIST and dtype == DataType.TEXT:
+            if size > 7:
+                return EfficiencyTriple(0.88, 0.82, 0.78)
+            return EfficiencyTriple(0.65, 0.70, 0.85)
+        if cls in (ControlType.SPINNER, ControlType.SLIDER) and dtype == DataType.UNSIGNED:
+            if size <= 3:
+                return EfficiencyTriple(0.85, 0.88, 0.82)
+            return EfficiencyTriple(0.72, 0.68, 0.80)
+        return EfficiencyTriple(0.50, 0.50, 0.50)
+
+    def evaluate_atomic(self, cls: ControlType, dtype: DataType, size: int) -> EfficiencyTriple:
+        code_str = self._code_by_control.get(cls)
+        if code_str:
+            local_ctx: Dict[str, object] = {
+                "dtype": dtype,
+                "size": int(size),
+                "ControlType": ControlType,
+                "DataType": DataType,
+                "EfficiencyTriple": EfficiencyTriple,
+                "max": max,
+                "min": min,
+            }
+            try:
+                exec(code_str, {"__builtins__": {}}, local_ctx)
+                p = float(local_ctx["p"])  # type: ignore[arg-type]
+                o = float(local_ctx["o"])  # type: ignore[arg-type]
+                r = float(local_ctx["r"])  # type: ignore[arg-type]
+                return EfficiencyTriple(p, o, r)
+            except Exception:
+                pass
+        return self._evaluate_empirical_fallback(cls, dtype, size)
