@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import itertools
 import math
 import random
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -491,6 +492,243 @@ def nsga2(
 
 def _vector_to_layout(space: DecisionSpace, evaluator: ObjectiveEvaluator, x: np.ndarray) -> InterfaceLayout:
   return space.decode_layout(x, evaluator.registry)
+
+
+BRUTE_FORCE_MAX_COMBINATIONS = 50_000
+
+
+def brute_force_search_space_size(space: DecisionSpace) -> int:
+  """Total discrete layouts: ∏ control choices × compositions of D fields into N forms."""
+  control_combos = 1
+  for cardinality in space.cardinalities():
+    control_combos *= max(1, cardinality)
+  d = space.control_dim()
+  n = space.partition_dim()
+  partition_combos = math.comb(d + n - 1, n - 1) if d >= 0 and n >= 1 else 1
+  return control_combos * partition_combos
+
+
+def _enumerate_field_partitions(d: int, n: int) -> Iterator[List[int]]:
+  """All non-negative integer vectors of length n summing to d (wizard step counts)."""
+  if n <= 0:
+    return
+  if n == 1:
+    yield [d]
+    return
+  for head in range(d + 1):
+    for tail in _enumerate_field_partitions(d - head, n - 1):
+      yield [head] + tail
+
+
+def brute_force(
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  max_combinations: int = BRUTE_FORCE_MAX_COMBINATIONS,
+) -> Dict[str, object]:
+  """
+  Exhaustive search over every control assignment and every valid wizard partition.
+
+  Raises ValueError when the search space exceeds ``max_combinations`` (default 50_000).
+  """
+  total = brute_force_search_space_size(space)
+  if total > max_combinations:
+    raise ValueError(
+      f"Brute force search space ({total} combinations) exceeds limit ({max_combinations}). "
+      "Reduce fields, allowed controls, or max_forms."
+    )
+
+  d = space.control_dim()
+  n = space.partition_dim()
+  cardinalities = space.cardinalities()
+  control_ranges = [range(max(1, c)) for c in cardinalities]
+  partitions = list(_enumerate_field_partitions(d, n))
+
+  best_score = -float("inf")
+  best_layout: Optional[InterfaceLayout] = None
+  history: List[float] = []
+
+  for control_combo in itertools.product(*control_ranges):
+    controls = space.all_controls(list(control_combo))
+    for partition in partitions:
+      layout = build_interface_layout_from_partition(space.fields, controls, partition)
+      score = evaluator.scalar_fitness(layout)
+      if score > best_score:
+        best_score = score
+        best_layout = layout
+      history.append(best_score)
+
+  if best_layout is None:
+    raise RuntimeError("Brute force found no valid layout")
+
+  return {
+    "best_score": best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat(),
+    "best_layout": best_layout,
+    "evaluations": len(history),
+    "search_space_size": total,
+  }
+
+
+def _genome_bounds(space: DecisionSpace) -> Tuple[np.ndarray, np.ndarray]:
+  """Per-gene lower/upper bounds for the D + N genome."""
+  lows: List[float] = []
+  highs: List[float] = []
+  for field in space.fields:
+    span = max(0, len(field.allowed_controls()) - 1)
+    lows.append(0.0)
+    highs.append(float(span))
+  d = space.control_dim()
+  for _ in range(space.partition_dim()):
+    lows.append(0.0)
+    highs.append(float(max(d, 1)))
+  return np.array(lows, dtype=float), np.array(highs, dtype=float)
+
+
+def _sbx_gene(
+  y1: float,
+  y2: float,
+  lb: float,
+  ub: float,
+  eta: float = 15.0,
+) -> Tuple[float, float]:
+  """Simulated binary crossover for one gene (Deb & Agrawal, 1995)."""
+  if abs(y1 - y2) <= 1e-14:
+    return y1, y2
+  if y1 > y2:
+    y1, y2 = y2, y1
+  span = max(1e-14, y2 - y1)
+
+  rand = random.random()
+  beta = 1.0 + (2.0 * (y1 - lb) / span)
+  alpha = 2.0 - beta ** (-(eta + 1.0))
+  if rand <= 1.0 / alpha:
+    betaq = (rand * alpha) ** (1.0 / (eta + 1.0))
+  else:
+    betaq = (1.0 / (2.0 - rand * alpha)) ** (1.0 / (eta + 1.0))
+  c1 = 0.5 * ((y1 + y2) - betaq * span)
+
+  rand = random.random()
+  beta = 1.0 + (2.0 * (ub - y2) / span)
+  alpha = 2.0 - beta ** (-(eta + 1.0))
+  if rand <= 1.0 / alpha:
+    betaq = (rand * alpha) ** (1.0 / (eta + 1.0))
+  else:
+    betaq = (1.0 / (2.0 - rand * alpha)) ** (1.0 / (eta + 1.0))
+  c2 = 0.5 * ((y1 + y2) + betaq * span)
+  return clamp(c1, lb, ub), clamp(c2, lb, ub)
+
+
+def _sbx_crossover(
+  parent1: np.ndarray,
+  parent2: np.ndarray,
+  bounds_low: np.ndarray,
+  bounds_high: np.ndarray,
+  crossover_prob: float = 0.9,
+  eta: float = 15.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+  child1 = parent1.copy()
+  child2 = parent2.copy()
+  for i in range(len(parent1)):
+    if random.random() > crossover_prob:
+      continue
+    c1, c2 = _sbx_gene(
+      float(parent1[i]),
+      float(parent2[i]),
+      float(bounds_low[i]),
+      float(bounds_high[i]),
+      eta=eta,
+    )
+    child1[i] = c1
+    child2[i] = c2
+  return child1, child2
+
+
+def _gaussian_mutate_genome(
+  genome: np.ndarray,
+  space: DecisionSpace,
+  mutation_prob: float = 0.2,
+  mutation_sigma: float = 0.5,
+) -> np.ndarray:
+  """Gaussian perturbation with bounds adapted to control vs partition segments."""
+  mutant = genome.copy()
+  bounds_low, bounds_high = _genome_bounds(space)
+  control_d = space.control_dim()
+  for i in range(len(mutant)):
+    if random.random() >= mutation_prob:
+      continue
+    sigma = mutation_sigma if i < control_d else mutation_sigma * max(1.0, space.control_dim() * 0.15)
+    mutant[i] = clamp(float(mutant[i]) + random.gauss(0.0, sigma), bounds_low[i], bounds_high[i])
+  return mutant
+
+
+def classic_genetic_algorithm(
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  pop_size: int = 30,
+  generations: int = 30,
+  crossover_prob: float = 0.9,
+  mutation_prob: float = 0.2,
+  mutation_sigma: float = 0.5,
+  tournament_size: int = 3,
+  sbx_eta: float = 15.0,
+  random_seed: int | None = None,
+) -> Dict[str, object]:
+  """
+  Single-objective genetic algorithm using scalar_fitness_from_triple().
+
+  Selection: tournament on scalar fitness.
+  Variation: SBX crossover + Gaussian mutation on the D + N genome.
+  """
+  if random_seed is not None:
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+
+  bounds_low, bounds_high = _genome_bounds(space)
+  population = [space.random_vector() for _ in range(pop_size)]
+  scores = np.array(
+    [evaluator.scalar_fitness(_vector_to_layout(space, evaluator, x)) for x in population]
+  )
+  best_index = int(np.argmax(scores))
+  best_layout = _vector_to_layout(space, evaluator, population[best_index])
+  best_score = float(scores[best_index])
+  history: List[float] = [best_score]
+
+  def tournament_select() -> np.ndarray:
+    candidates = random.sample(range(pop_size), min(tournament_size, pop_size))
+    winner = max(candidates, key=lambda i: scores[i])
+    return population[winner].copy()
+
+  for _ in range(generations):
+    offspring: List[np.ndarray] = []
+    while len(offspring) < pop_size:
+      p1 = tournament_select()
+      p2 = tournament_select()
+      c1, c2 = _sbx_crossover(p1, p2, bounds_low, bounds_high, crossover_prob, sbx_eta)
+      offspring.append(_gaussian_mutate_genome(c1, space, mutation_prob, mutation_sigma))
+      if len(offspring) < pop_size:
+        offspring.append(_gaussian_mutate_genome(c2, space, mutation_prob, mutation_sigma))
+
+    offspring_scores = np.array(
+      [evaluator.scalar_fitness(_vector_to_layout(space, evaluator, x)) for x in offspring]
+    )
+    combined_pop = population + offspring
+    combined_scores = np.concatenate([scores, offspring_scores])
+    order = np.argsort(combined_scores)[::-1]
+    population = [combined_pop[i] for i in order[:pop_size]]
+    scores = combined_scores[order[:pop_size]]
+
+    if scores[0] > best_score:
+      best_score = float(scores[0])
+      best_layout = _vector_to_layout(space, evaluator, population[0])
+    history.append(best_score)
+
+  return {
+    "best_score": best_score,
+    "history": history,
+    "best_controls": best_layout.controls_flat(),
+    "best_layout": best_layout,
+  }
 
 
 def hill_climb(

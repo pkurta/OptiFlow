@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -21,6 +22,8 @@ from optiflow.optimization.algorithms import (
   TargetMode,
   TargetProfile,
   aco,
+  brute_force,
+  classic_genetic_algorithm,
   compute_total_efficiency,
   greedy,
   hill_climb,
@@ -33,6 +36,7 @@ from optiflow.optimization.algorithms import (
   simulated_annealing,
   tabu_search,
 )
+from optiflow.benchmarks import run_optimization_benchmark
 from optiflow.ui.web_generator import generate_html_from_layout
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
@@ -292,6 +296,11 @@ if _HAS_PYQT5:
       {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 200, "step": 50},
     ],
       "Жадный (Greedy)": [],
+      "Полный перебор (Brute Force)": [],
+      "Классический генетический алгоритм (GA)": [
+      {"key": "pop_size", "label": "Размер популяции", "type": "int", "min": 10, "max": 1000, "default": 30, "step": 10},
+      {"key": "generations", "label": "Поколения", "type": "int", "min": 1, "max": 1000, "default": 30, "step": 5},
+    ],
       "Имитация отжига (SA)": [
       {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 300, "step": 50},
       {"key": "initial_temp", "label": "Начальная температура", "type": "float", "min": 0.1, "max": 100.0, "default": 5.0, "step": 0.5, "decimals": 3},
@@ -317,6 +326,8 @@ if _HAS_PYQT5:
       self.algorithm_combo = QtWidgets.QComboBox()
       self.algorithm_combo.addItems([
         "Многокритериальный (NSGA-II)",
+        "Классический генетический алгоритм (GA)",
+        "Полный перебор (Brute Force)",
         "Локальный поиск (Hill Climb)",
         "Алгоритм роя частиц (PSO)",
         "Случайный поиск",
@@ -503,6 +514,8 @@ if _HAS_PYQT5:
         return self.alg_tab.params_for(name)
 
       p_nsga = params("Многокритериальный (NSGA-II)")
+      p_bf = params("Полный перебор (Brute Force)")
+      p_cga = params("Классический генетический алгоритм (GA)")
       p_hc = params("Локальный поиск (Hill Climb)")
       p_pso = params("Алгоритм роя частиц (PSO)")
       p_rs = params("Случайный поиск")
@@ -518,6 +531,21 @@ if _HAS_PYQT5:
         crossover_prob=float(p_nsga.get("crossover_prob", 0.9)),
         mutation_prob=float(p_nsga.get("mutation_prob", 0.2)),
         mutation_sigma=float(p_nsga.get("mutation_sigma", 0.5)),
+      )
+      try:
+        res_bf = brute_force(space, evaluator)
+      except ValueError as exc:
+        res_bf = {"best_score": 0.0, "history": [], "best_layout": None}
+        QtWidgets.QMessageBox.warning(
+          self,
+          "Полный перебор (Brute Force)",
+          str(exc),
+        )
+      res_cga = classic_genetic_algorithm(
+        space,
+        evaluator,
+        pop_size=int(p_cga.get("pop_size", 30)),
+        generations=int(p_cga.get("generations", 30)),
       )
       res_hc = hill_climb(space, evaluator, iterations=int(p_hc.get("iterations", 200)))
       res_pso = pso(
@@ -556,6 +584,9 @@ if _HAS_PYQT5:
       )
 
       histories.append(("NSGA-II", res_nsga["history"]))
+      if res_bf.get("history"):
+        histories.append(("BruteForce", res_bf["history"]))
+      histories.append(("GA", res_cga["history"]))
       histories.append(("HillClimb", res_hc["history"]))
       histories.append(("PSO", res_pso["history"]))
       histories.append(("Random", res_rs["history"]))
@@ -567,6 +598,8 @@ if _HAS_PYQT5:
 
       self.last_best_layouts = {
         "NSGA-II": res_nsga.get("best_layout"),
+        "BruteForce": res_bf.get("best_layout"),
+        "GA": res_cga.get("best_layout"),
         "HillClimb": res_hc.get("best_layout"),
         "PSO": res_pso.get("best_layout"),
         "Random": res_rs.get("best_layout"),
@@ -581,6 +614,8 @@ if _HAS_PYQT5:
       preferred = self.alg_tab.current_algorithm()
       name_map = {
         "Многокритериальный (NSGA-II)": "NSGA-II",
+        "Классический генетический алгоритм (GA)": "GA",
+        "Полный перебор (Brute Force)": "BruteForce",
         "Локальный поиск (Hill Climb)": "HillClimb",
         "Алгоритм роя частиц (PSO)": "PSO",
         "Случайный поиск": "Random",
@@ -590,7 +625,19 @@ if _HAS_PYQT5:
         "Муравьиный алгоритм (ACO)": "ACO",
       }
       preferred_key = name_map.get(preferred, preferred)
-      key_order = [preferred_key, "NSGA-II", "PSO", "HillClimb", "Random", "Greedy", "SA", "Tabu", "ACO"]
+      key_order = [
+        preferred_key,
+        "BruteForce",
+        "GA",
+        "NSGA-II",
+        "PSO",
+        "HillClimb",
+        "Random",
+        "Greedy",
+        "SA",
+        "Tabu",
+        "ACO",
+      ]
       for key in key_order:
         if self.last_best_layouts.get(key):
           layout = self.last_best_layouts[key]
@@ -735,6 +782,9 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
     out = _APP_ROOT / out
   out.write_text(html, encoding="utf-8")
   print(f"Wrote wizard layout ({best_layout.form_count} forms) -> {out.resolve()}")
+
+  logging.basicConfig(level=logging.INFO)
+  run_optimization_benchmark(runs_count=20, random_seed=42, output_dir=out.parent, log_markdown=True)
   return out
 
 

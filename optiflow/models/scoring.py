@@ -75,6 +75,13 @@ class InterfaceLayout:
     def form_count(self) -> int:
         return len(self.forms)
 
+    def controls_flat(self) -> List[ControlType]:
+        result: List[ControlType] = []
+        for form in self.forms:
+            for element in form.elements:
+                result.append(element.control)
+        return result
+
 def evaluate_form(element_count: int) -> EfficiencyTriple:
     count = max(0, int(element_count))
     return EfficiencyTriple(
