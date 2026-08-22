@@ -3,6 +3,8 @@ from __future__ import annotations
 import itertools
 import math
 import random
+import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -195,6 +197,108 @@ def calculate_fitness(
     + weights.w_resource_saving * triple.resource_saving
     - max(0.0, float(penalties))
   )
+
+
+@dataclass(frozen=True)
+class ProgressReport:
+  algorithm: str
+  algorithm_index: int
+  algorithm_count: int
+  iteration: int
+  max_iterations: int
+  best_fitness: float
+  potency: float
+  operativeness: float
+  resource_saving: float
+  overall_fraction: float
+
+
+class OptimizationControl:
+  """Thread-safe cancel token + throttled progress callback for UI overlay."""
+
+  def __init__(
+    self,
+    on_progress: Optional[Callable[[ProgressReport], None]] = None,
+    *,
+    min_interval_s: float = 0.05,
+  ) -> None:
+    self._cancel = threading.Event()
+    self._on_progress = on_progress
+    self._min_interval_s = min_interval_s
+    self._last_emit = 0.0
+    self.algorithm = ""
+    self.algorithm_index = 0
+    self.algorithm_count = 1
+
+  def cancel(self) -> None:
+    self._cancel.set()
+
+  @property
+  def cancelled(self) -> bool:
+    return self._cancel.is_set()
+
+  def begin_algorithm(self, name: str, index: int, count: int) -> None:
+    self.algorithm = name
+    self.algorithm_index = index
+    self.algorithm_count = max(1, count)
+    self.notify(0, 1, 0.0, force=True)
+
+  def notify(
+    self,
+    iteration: int,
+    max_iterations: int,
+    best_fitness: float,
+    *,
+    triple: Optional[EfficiencyTriple] = None,
+    layout: Optional[InterfaceLayout] = None,
+    evaluator: Optional[ObjectiveEvaluator] = None,
+    force: bool = False,
+  ) -> bool:
+    """Push telemetry. Returns True when the run should stop."""
+    if self._cancel.is_set():
+      return True
+    now = time.monotonic()
+    if not force and (now - self._last_emit) < self._min_interval_s:
+      return False
+    self._last_emit = now
+    if triple is None and layout is not None and evaluator is not None:
+      triple = evaluator.evaluate_layout(layout)
+    potency = operativeness = resource_saving = 0.0
+    if triple is not None:
+      potency, operativeness, resource_saving = triple.as_tuple()
+    max_iterations = max(1, int(max_iterations))
+    iteration = max(0, int(iteration))
+    local = min(1.0, iteration / max_iterations)
+    overall = (self.algorithm_index + local) / self.algorithm_count
+    if self._on_progress is not None:
+      self._on_progress(
+        ProgressReport(
+          algorithm=self.algorithm,
+          algorithm_index=self.algorithm_index,
+          algorithm_count=self.algorithm_count,
+          iteration=iteration,
+          max_iterations=max_iterations,
+          best_fitness=float(best_fitness),
+          potency=potency,
+          operativeness=operativeness,
+          resource_saving=resource_saving,
+          overall_fraction=max(0.0, min(1.0, overall)),
+        )
+      )
+      time.sleep(0.001)
+    return self._cancel.is_set()
+
+
+def emit_progress(
+  control: Optional[OptimizationControl],
+  iteration: int,
+  max_iterations: int,
+  best_fitness: float,
+  **kwargs: object,
+) -> bool:
+  if control is None:
+    return False
+  return control.notify(iteration, max_iterations, best_fitness, **kwargs)  # type: ignore[arg-type]
 
 
 def compute_total_efficiency(layout: InterfaceLayout, registry: FunctionRegistry) -> EfficiencyTriple:
@@ -490,6 +594,7 @@ def nsga2(
   mutation_prob: float = 0.2,
   mutation_sigma: float = 0.5,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ):
   if random_seed is not None:
     random.seed(random_seed)
@@ -575,6 +680,16 @@ def nsga2(
     best_triple = EfficiencyTriple(*objectives[chosen_index])
     history_best_scalar.append(calculate_fitness(best_triple, evaluator.weights))
     history_best_triple.append(best_triple)
+    if emit_progress(
+      control,
+      _g + 1,
+      generations,
+      history_best_scalar[-1],
+      triple=best_triple,
+      layout=best_layout,
+      evaluator=evaluator,
+    ):
+      break
 
   if best_layout is None and population:
     best_layout = space.decode_layout(population[0], evaluator.registry)
@@ -622,6 +737,7 @@ def brute_force(
   space: DecisionSpace,
   evaluator: ObjectiveEvaluator,
   max_combinations: int = BRUTE_FORCE_MAX_COMBINATIONS,
+  control: Optional[OptimizationControl] = None,
 ) -> Dict[str, object]:
   """
   Exhaustive search over every control assignment and every valid wizard partition.
@@ -644,8 +760,12 @@ def brute_force(
   best_score = -float("inf")
   best_layout: Optional[InterfaceLayout] = None
   history: List[float] = []
+  evaluations = 0
+  cancelled = False
 
   for control_combo in itertools.product(*control_ranges):
+    if cancelled:
+      break
     controls = space.all_controls(list(control_combo))
     for partition in partitions:
       layout = build_interface_layout_from_partition(space.fields, controls, partition)
@@ -654,6 +774,17 @@ def brute_force(
         best_score = score
         best_layout = layout
       history.append(best_score)
+      evaluations += 1
+      if emit_progress(
+        control,
+        evaluations,
+        total,
+        best_score,
+        layout=best_layout,
+        evaluator=evaluator,
+      ):
+        cancelled = True
+        break
 
   if best_layout is None:
     raise RuntimeError("Brute force found no valid layout")
@@ -771,6 +902,7 @@ def classic_genetic_algorithm(
   tournament_size: int = 3,
   sbx_eta: float = 15.0,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ) -> Dict[str, object]:
   """
   Single-objective genetic algorithm using calculate_fitness() / CriterionWeights.
@@ -820,6 +952,15 @@ def classic_genetic_algorithm(
       best_score = float(scores[0])
       best_layout = _vector_to_layout(space, evaluator, population[0])
     history.append(best_score)
+    if emit_progress(
+      control,
+      len(history) - 1,
+      generations,
+      best_score,
+      layout=best_layout,
+      evaluator=evaluator,
+    ):
+      break
 
   return {
     "best_score": best_score,
@@ -834,6 +975,7 @@ def hill_climb(
   evaluator: ObjectiveEvaluator,
   iterations: int = 200,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ):
   if random_seed is not None:
     random.seed(random_seed)
@@ -877,6 +1019,15 @@ def hill_climb(
     if current_score > best_score:
       best_score = current_score
       best_layout = current_layout
+    if emit_progress(
+      control,
+      len(history),
+      iterations,
+      best_score,
+      layout=best_layout,
+      evaluator=evaluator,
+    ):
+      break
     if not improved:
       break
 
@@ -897,6 +1048,7 @@ def pso(
   cognitive: float = 1.5,
   social: float = 1.5,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ):
   if random_seed is not None:
     random.seed(random_seed)
@@ -936,6 +1088,15 @@ def pso(
           global_best_score = score
           global_best_position = positions[i].copy()
     history.append(global_best_score)
+    if emit_progress(
+      control,
+      len(history) - 1,
+      iterations,
+      global_best_score,
+      layout=_vector_to_layout(space, evaluator, global_best_position),
+      evaluator=evaluator,
+    ):
+      break
 
   best_layout = _vector_to_layout(space, evaluator, global_best_position)
   return {
@@ -951,6 +1112,7 @@ def random_search(
   evaluator: ObjectiveEvaluator,
   iterations: int = 200,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ):
   if random_seed is not None:
     random.seed(random_seed)
@@ -967,6 +1129,15 @@ def random_search(
       best_score = score
       best_layout = layout
     history.append(best_score)
+    if emit_progress(
+      control,
+      len(history),
+      iterations,
+      best_score,
+      layout=best_layout,
+      evaluator=evaluator,
+    ):
+      break
   return {
     "best_score": best_score,
     "history": history,
@@ -975,7 +1146,11 @@ def random_search(
   }
 
 
-def greedy(space: DecisionSpace, evaluator: ObjectiveEvaluator) -> Dict[str, object]:
+def greedy(
+  space: DecisionSpace,
+  evaluator: ObjectiveEvaluator,
+  control: Optional[OptimizationControl] = None,
+) -> Dict[str, object]:
   control_idx = [0] * len(space.fields)
   partition_counts = [len(space.fields)] + [0] * (space.partition_dim() - 1)
   controls = space.all_controls(control_idx)
@@ -999,6 +1174,20 @@ def greedy(space: DecisionSpace, evaluator: ObjectiveEvaluator) -> Dict[str, obj
     controls = space.all_controls(control_idx)
     layout = build_interface_layout(space.fields, controls, form_idx)
     best_score = evaluator.scalar_fitness(layout)
+    if emit_progress(
+      control,
+      field_i + 1,
+      max(1, len(space.fields)),
+      best_score,
+      layout=layout,
+      evaluator=evaluator,
+    ):
+      return {
+        "best_score": best_score,
+        "history": [best_score],
+        "best_controls": layout.controls_flat(),
+        "best_layout": layout,
+      }
 
   d = len(space.fields)
   improved_partition = True
@@ -1038,6 +1227,7 @@ def simulated_annealing(
   initial_temp: float = 5.0,
   cooling: float = 0.97,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ):
   if random_seed is not None:
     random.seed(random_seed)
@@ -1073,6 +1263,15 @@ def simulated_annealing(
       best_layout = current_layout
     history.append(best_score)
     temp *= cooling
+    if emit_progress(
+      control,
+      len(history) - 1,
+      iterations,
+      best_score,
+      layout=best_layout,
+      evaluator=evaluator,
+    ):
+      break
 
   return {
     "best_score": best_score,
@@ -1088,6 +1287,7 @@ def tabu_search(
   iterations: int = 200,
   tabu_tenure: int = 7,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ):
   if random_seed is not None:
     random.seed(random_seed)
@@ -1155,6 +1355,15 @@ def tabu_search(
       best_score = current_score
       best_layout = current_layout
     history.append(best_score)
+    if emit_progress(
+      control,
+      len(history) - 1,
+      iterations,
+      best_score,
+      layout=best_layout,
+      evaluator=evaluator,
+    ):
+      break
 
   return {
     "best_score": best_score,
@@ -1174,6 +1383,7 @@ def aco(
   evaporation: float = 0.1,
   deposit_weight: float = 1.0,
   random_seed: int | None = None,
+  control: Optional[OptimizationControl] = None,
 ):
   if random_seed is not None:
     random.seed(random_seed)
@@ -1239,6 +1449,15 @@ def aco(
         best_score = iteration_best
         best_layout = iteration_best_layout
     history.append(best_score if best_score >= 0 else iteration_best)
+    if emit_progress(
+      control,
+      len(history),
+      iterations,
+      best_score if best_score >= 0 else iteration_best,
+      layout=best_layout,
+      evaluator=evaluator,
+    ):
+      break
 
   return {
     "best_score": best_score,

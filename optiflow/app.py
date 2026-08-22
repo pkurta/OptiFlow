@@ -22,6 +22,8 @@ from optiflow.optimization.algorithms import (
   DEFAULT_WEIGHT_PRESET,
   DecisionSpace,
   ObjectiveEvaluator,
+  OptimizationControl,
+  ProgressReport,
   WEIGHT_PRESETS,
   aco,
   brute_force,
@@ -36,6 +38,11 @@ from optiflow.optimization.algorithms import (
   redistribute_weight_ticks,
   simulated_annealing,
   tabu_search,
+)
+from optiflow.optimization.runner import (
+  SUITE_STEPS,
+  histories_from_results,
+  run_optimization_suite,
 )
 from optiflow.benchmarks import run_optimization_benchmark
 from optiflow.ui.web_generator import generate_html_from_layout
@@ -493,6 +500,9 @@ if _HAS_PYQT5:
       self.algorithm_combo.currentTextChanged.connect(self._on_algorithm_changed)
       self._on_algorithm_changed(self.algorithm_combo.currentText())
 
+    def set_run_enabled(self, enabled: bool) -> None:
+      self.run_btn.setEnabled(enabled)
+
     def current_algorithm(self) -> str:
       return self.algorithm_combo.currentText()
 
@@ -531,6 +541,166 @@ if _HAS_PYQT5:
         else:
           values[cfg["key"]] = float(val)
       return values
+
+
+  class ProgressOverlay(QtWidgets.QWidget):
+    cancelRequested = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+      super().__init__(parent)
+      self.setObjectName("progressOverlay")
+      self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+      self.setStyleSheet(
+        """
+        QWidget#progressOverlay { background-color: rgba(7, 10, 18, 175); }
+        QFrame#progressCard {
+          background-color: #1b2330;
+          border: 1px solid #4d5d74;
+          border-radius: 18px;
+        }
+        QLabel#progressTitle { color: #f4f7fb; font-size: 16px; font-weight: 600; }
+        QLabel#progressStep { color: #8fa0b8; font-size: 12px; }
+        QLabel#progressMetric { color: #d5deea; font-size: 13px; }
+        QLabel#progressTime { color: #9eb0c7; font-size: 12px; }
+        QPushButton#progressCancel {
+          background-color: #c44536;
+          color: white;
+          border: none;
+          border-radius: 8px;
+          padding: 8px 22px;
+          font-weight: 600;
+        }
+        QPushButton#progressCancel:hover { background-color: #a8382c; }
+        QPushButton#progressCancel:disabled { background-color: #667084; }
+        QProgressBar {
+          border: none;
+          border-radius: 8px;
+          background: #2a3344;
+          min-height: 16px;
+          text-align: center;
+          color: #eef3fa;
+        }
+        QProgressBar::chunk {
+          border-radius: 8px;
+          background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+            stop:0 #3b82f6, stop:1 #22d3ee);
+        }
+        """
+      )
+      root = QtWidgets.QVBoxLayout(self)
+      root.setContentsMargins(24, 24, 24, 24)
+      root.addStretch(1)
+      card = QtWidgets.QFrame()
+      card.setObjectName("progressCard")
+      card.setMinimumWidth(520)
+      card.setMaximumWidth(640)
+      card_layout = QtWidgets.QVBoxLayout(card)
+      card_layout.setContentsMargins(28, 24, 28, 24)
+      card_layout.setSpacing(12)
+      self.title_label = QtWidgets.QLabel("Подготовка…")
+      self.title_label.setObjectName("progressTitle")
+      self.title_label.setWordWrap(True)
+      self.step_label = QtWidgets.QLabel("Алгоритм 0 из 10")
+      self.step_label.setObjectName("progressStep")
+      self.bar = QtWidgets.QProgressBar()
+      self.bar.setRange(0, 1000)
+      self.bar.setValue(0)
+      self.bar.setTextVisible(True)
+      self.bar.setFormat("%p%")
+      self.metrics_label = QtWidgets.QLabel("F = —    P = —    O = —    R = —")
+      self.metrics_label.setObjectName("progressMetric")
+      self.time_label = QtWidgets.QLabel("Время: 00:00")
+      self.time_label.setObjectName("progressTime")
+      self.cancel_btn = QtWidgets.QPushButton("Прервать")
+      self.cancel_btn.setObjectName("progressCancel")
+      self.cancel_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
+      self.cancel_btn.clicked.connect(self._on_cancel)
+      card_layout.addWidget(self.title_label)
+      card_layout.addWidget(self.step_label)
+      card_layout.addWidget(self.bar)
+      card_layout.addWidget(self.metrics_label)
+      card_layout.addWidget(self.time_label)
+      card_layout.addWidget(self.cancel_btn, 0, QtCore.Qt.AlignLeft)
+      row = QtWidgets.QHBoxLayout()
+      row.addStretch(1)
+      row.addWidget(card)
+      row.addStretch(1)
+      root.addLayout(row)
+      root.addStretch(1)
+      self._elapsed = QtCore.QElapsedTimer()
+      self._ticker = QtCore.QTimer(self)
+      self._ticker.timeout.connect(self._refresh_elapsed)
+      self.hide()
+
+    def start(self) -> None:
+      self.cancel_btn.setEnabled(True)
+      self.cancel_btn.setText("Прервать")
+      self.bar.setValue(0)
+      self.title_label.setText("Запуск оптимизации…")
+      self.step_label.setText("Алгоритм 0 из 10")
+      self.metrics_label.setText("F = —    P = —    O = —    R = —")
+      self.time_label.setText("Время: 00:00")
+      self._elapsed.start()
+      self._ticker.start(100)
+      self.show()
+      self.raise_()
+
+    def stop(self) -> None:
+      self._ticker.stop()
+      self.hide()
+
+    def apply_report(self, report: ProgressReport) -> None:
+      self.title_label.setText(
+        f"{report.algorithm} — шаг {report.iteration} / {report.max_iterations}"
+      )
+      self.step_label.setText(
+        f"Алгоритм {report.algorithm_index + 1} из {report.algorithm_count}"
+      )
+      self.bar.setValue(int(round(report.overall_fraction * 1000)))
+      self.metrics_label.setText(
+        f"F = {report.best_fitness:.4f}    "
+        f"P = {report.potency:.3f}    "
+        f"O = {report.operativeness:.3f}    "
+        f"R = {report.resource_saving:.3f}"
+      )
+
+    def _refresh_elapsed(self) -> None:
+      ms = self._elapsed.elapsed() if self._elapsed.isValid() else 0
+      seconds = ms // 1000
+      self.time_label.setText(f"Время: {seconds // 60:02d}:{seconds % 60:02d}")
+
+    def _on_cancel(self) -> None:
+      self.cancel_btn.setEnabled(False)
+      self.cancel_btn.setText("Остановка…")
+      self.cancelRequested.emit()
+
+
+  class OptimizationWorker(QtCore.QThread):
+    progress = QtCore.pyqtSignal(object)
+    completed = QtCore.pyqtSignal(object)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+      self,
+      space: DecisionSpace,
+      evaluator: ObjectiveEvaluator,
+      params_by_label: Dict[str, Dict[str, float]],
+      parent=None,
+    ) -> None:
+      super().__init__(parent)
+      self._space = space
+      self._evaluator = evaluator
+      self._params = params_by_label
+      self.control: Optional[OptimizationControl] = None
+
+    def run(self) -> None:
+      try:
+        payload = run_optimization_suite(
+          self._space, self._evaluator, self._params, self.control
+        )
+        self.completed.emit(payload)
+      except Exception as exc:
+        self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
   class ChartsTab(QtWidgets.QWidget):
@@ -661,6 +831,11 @@ if _HAS_PYQT5:
       self.field_table.add_field("Согласие", DataType.BOOLEAN, 1)
 
       self.last_best_layouts: Dict[str, Optional[InterfaceLayout]] = {}
+      self._worker: Optional[OptimizationWorker] = None
+      self._run_control: Optional[OptimizationControl] = None
+      self.overlay = ProgressOverlay(self)
+      self.overlay.cancelRequested.connect(self._cancel_optimization)
+      self.overlay.hide()
 
     def _add_field(self) -> None:
       self.field_table.add_field(self.field_table.next_default_field_name(), DataType.TEXT, 16)
@@ -669,6 +844,14 @@ if _HAS_PYQT5:
       rows = sorted({i.row() for i in self.field_table.selectedIndexes()}, reverse=True)
       for r in rows:
         self.field_table.removeRow(r)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+      super().resizeEvent(event)
+      self.overlay.setGeometry(self.rect())
+
+    def _cancel_optimization(self) -> None:
+      if self._run_control is not None:
+        self._run_control.cancel()
 
     def _set_weights(self, weights: CriterionWeights) -> None:
       self.weights = weights
@@ -686,108 +869,32 @@ if _HAS_PYQT5:
       return space, evaluator
 
     def run_algorithms(self) -> None:
+      if self._worker is not None and self._worker.isRunning():
+        return
       space, evaluator = self._build_space()
-      histories: List[Tuple[str, List[float]]] = []
+      params_by_label = {label: self.alg_tab.params_for(label) for _, label in SUITE_STEPS}
+      self._worker = OptimizationWorker(space, evaluator, params_by_label, parent=self)
+      self._run_control = OptimizationControl(on_progress=self._worker.progress.emit)
+      self._worker.control = self._run_control
+      self._worker.progress.connect(self.overlay.apply_report)
+      self._worker.completed.connect(self._on_suite_finished)
+      self._worker.failed.connect(self._on_suite_failed)
+      self._worker.finished.connect(self._clear_worker)
+      self.alg_tab.set_run_enabled(False)
+      self.overlay.setGeometry(self.rect())
+      self.overlay.start()
+      self._worker.start()
 
-      def params(name: str) -> Dict[str, float]:
-        return self.alg_tab.params_for(name)
-
-      p_nsga = params("Многокритериальный (NSGA-II)")
-      p_bf = params("Полный перебор (Brute Force)")
-      p_cga = params("Классический генетический алгоритм (GA)")
-      p_hc = params("Локальный поиск (Hill Climb)")
-      p_pso = params("Алгоритм роя частиц (PSO)")
-      p_rs = params("Случайный поиск")
-      p_sa = params("Имитация отжига (SA)")
-      p_tabu = params("Поиск с запретами (Tabu)")
-      p_aco = params("Муравьиный алгоритм (ACO)")
-
-      res_nsga = nsga2(
-        space,
-        evaluator,
-        pop_size=int(p_nsga.get("pop_size", 40)),
-        generations=int(p_nsga.get("generations", 40)),
-        crossover_prob=float(p_nsga.get("crossover_prob", 0.9)),
-        mutation_prob=float(p_nsga.get("mutation_prob", 0.2)),
-        mutation_sigma=float(p_nsga.get("mutation_sigma", 0.5)),
-      )
-      try:
-        res_bf = brute_force(space, evaluator)
-      except ValueError as exc:
-        res_bf = {"best_score": 0.0, "history": [], "best_layout": None}
-        QtWidgets.QMessageBox.warning(
-          self,
-          "Полный перебор (Brute Force)",
-          str(exc),
-        )
-      res_cga = classic_genetic_algorithm(
-        space,
-        evaluator,
-        pop_size=int(p_cga.get("pop_size", 30)),
-        generations=int(p_cga.get("generations", 30)),
-      )
-      res_hc = hill_climb(space, evaluator, iterations=int(p_hc.get("iterations", 200)))
-      res_pso = pso(
-        space,
-        evaluator,
-        swarm_size=int(p_pso.get("swarm_size", 30)),
-        iterations=int(p_pso.get("iterations", 50)),
-        inertia=float(p_pso.get("inertia", 0.7)),
-        cognitive=float(p_pso.get("cognitive", 1.5)),
-        social=float(p_pso.get("social", 1.5)),
-      )
-      res_rs = random_search(space, evaluator, iterations=int(p_rs.get("iterations", 200)))
-      res_greedy = greedy(space, evaluator)
-      res_sa = simulated_annealing(
-        space,
-        evaluator,
-        iterations=int(p_sa.get("iterations", 300)),
-        initial_temp=float(p_sa.get("initial_temp", 5.0)),
-        cooling=float(p_sa.get("cooling", 0.97)),
-      )
-      res_tabu = tabu_search(
-        space,
-        evaluator,
-        iterations=int(p_tabu.get("iterations", 200)),
-        tabu_tenure=int(p_tabu.get("tabu_tenure", 7)),
-      )
-      res_aco = aco(
-        space,
-        evaluator,
-        ants=int(p_aco.get("ants", 20)),
-        iterations=int(p_aco.get("iterations", 40)),
-        alpha=float(p_aco.get("alpha", 1.0)),
-        beta=float(p_aco.get("beta", 2.0)),
-        evaporation=float(p_aco.get("evaporation", 0.1)),
-        deposit_weight=float(p_aco.get("deposit_weight", 1.0)),
-      )
-
-      histories.append(("NSGA-II", res_nsga["history"]))
-      if res_bf.get("history"):
-        histories.append(("BruteForce", res_bf["history"]))
-      histories.append(("GA", res_cga["history"]))
-      histories.append(("HillClimb", res_hc["history"]))
-      histories.append(("PSO", res_pso["history"]))
-      histories.append(("Random", res_rs["history"]))
-      histories.append(("Greedy", res_greedy["history"]))
-      histories.append(("SA", res_sa["history"]))
-      histories.append(("Tabu", res_tabu["history"]))
-      histories.append(("ACO", res_aco["history"]))
-      self.charts_tab.plot_histories(histories)
-
-      self.last_best_layouts = {
-        "NSGA-II": res_nsga.get("best_layout"),
-        "BruteForce": res_bf.get("best_layout"),
-        "GA": res_cga.get("best_layout"),
-        "HillClimb": res_hc.get("best_layout"),
-        "PSO": res_pso.get("best_layout"),
-        "Random": res_rs.get("best_layout"),
-        "Greedy": res_greedy.get("best_layout"),
-        "SA": res_sa.get("best_layout"),
-        "Tabu": res_tabu.get("best_layout"),
-        "ACO": res_aco.get("best_layout"),
-      }
-
+    def _on_suite_finished(self, payload: object) -> None:
+      data = payload if isinstance(payload, dict) else {}
+      results: Dict[str, Dict[str, object]] = data.get("results") or {}
+      warning = data.get("warning")
+      cancelled = bool(data.get("cancelled"))
+      self.last_best_layouts = {}
+      for key, _label in SUITE_STEPS:
+        payload_one = results.get(key) or {}
+        self.last_best_layouts[key] = payload_one.get("best_layout")
+      self.charts_tab.plot_histories(histories_from_results(results))
       result_rows: List[Tuple[str, Optional[EfficiencyTriple], float, int]] = []
       for name, layout in self.last_best_layouts.items():
         if layout is None:
@@ -797,6 +904,28 @@ if _HAS_PYQT5:
         fitness = calculate_fitness(triple, self.weights)
         result_rows.append((name, triple, fitness, layout.form_count))
       self.charts_tab.show_results(self.weights, result_rows)
+      self.overlay.stop()
+      self.alg_tab.set_run_enabled(True)
+      if warning:
+        QtWidgets.QMessageBox.warning(self, "Полный перебор (Brute Force)", str(warning))
+      if cancelled:
+        QtWidgets.QMessageBox.information(
+          self,
+          "Оптимизация прервана",
+          "Расчёт остановлен. Сохранён лучший найденный на этот момент набор решений.",
+        )
+      tabs = self.centralWidget()
+      if isinstance(tabs, QtWidgets.QTabWidget):
+        tabs.setCurrentWidget(self.charts_tab)
+
+    def _on_suite_failed(self, message: str) -> None:
+      self.overlay.stop()
+      self.alg_tab.set_run_enabled(True)
+      QtWidgets.QMessageBox.critical(self, "Ошибка оптимизации", message)
+
+    def _clear_worker(self) -> None:
+      self._worker = None
+      self._run_control = None
 
     def export_web(self) -> None:
       layout: Optional[InterfaceLayout] = None

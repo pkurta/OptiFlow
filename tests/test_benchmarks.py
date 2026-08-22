@@ -19,11 +19,13 @@ from optiflow.optimization.algorithms import (
   CriterionWeights,
   DecisionSpace,
   ObjectiveEvaluator,
+  OptimizationControl,
   brute_force,
   brute_force_search_space_size,
   calculate_fitness,
   classic_genetic_algorithm,
   compute_total_efficiency,
+  random_search,
   redistribute_weight_ticks,
 )
 
@@ -63,6 +65,28 @@ class CriterionWeightsTests(unittest.TestCase):
     weights = CriterionWeights.from_raw(0.5, 0.3, 0.2)
     expected = 0.5 * 0.8 + 0.3 * 0.4 + 0.2 * 0.2 - 0.1
     self.assertAlmostEqual(calculate_fitness(triple, weights, penalties=0.1), expected)
+
+
+class ProgressControlTests(unittest.TestCase):
+  def test_random_search_stops_when_cancelled(self) -> None:
+    fields = [
+      FieldSpec("A", DataType.BOOLEAN, 1),
+      FieldSpec("B", DataType.UNSIGNED, 2),
+    ]
+    ensure_allowed_controls(fields)
+    space = DecisionSpace(fields, max_forms=1)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+    control = OptimizationControl(min_interval_s=0.0)
+
+    def on_progress(report) -> None:
+      if report.iteration >= 3:
+        control.cancel()
+
+    control._on_progress = on_progress
+    result = random_search(space, evaluator, iterations=400, random_seed=3, control=control)
+    self.assertLess(len(result["history"]), 400)
+    self.assertIsNotNone(result["best_layout"])
+    self.assertTrue(control.cancelled)
 
 
 class BruteForceTests(unittest.TestCase):
