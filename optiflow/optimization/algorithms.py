@@ -65,6 +65,138 @@ class TargetProfile:
     )
 
 
+WEIGHT_PRESETS: Dict[str, Tuple[float, float, float]] = {
+  "Баланс — все критерии равны": (0.34, 0.33, 0.33),
+  "Банк — упор на результативность": (0.70, 0.20, 0.10),
+  "Call-центр / МЧС — упор на оперативность": (0.20, 0.70, 0.10),
+  "Массовый сервис — упор на ресурсоэкономность": (0.20, 0.10, 0.70),
+}
+
+CUSTOM_WEIGHT_PRESET = "Свой вариант"
+DEFAULT_WEIGHT_PRESET = "Баланс — все критерии равны"
+
+
+@dataclass(frozen=True)
+class CriterionWeights:
+  """Normalized priority weights: w1 + w2 + w3 = 1, wi >= 0."""
+
+  w_potency: float
+  w_operativeness: float
+  w_resource_saving: float
+
+  def as_tuple(self) -> Tuple[float, float, float]:
+    return (self.w_potency, self.w_operativeness, self.w_resource_saving)
+
+  @classmethod
+  def from_raw(cls, w1: float, w2: float, w3: float) -> "CriterionWeights":
+    a, b, c = max(0.0, float(w1)), max(0.0, float(w2)), max(0.0, float(w3))
+    total = a + b + c
+    if total <= 0.0:
+      return cls(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+    return cls(a / total, b / total, c / total)
+
+  @classmethod
+  def balanced(cls) -> "CriterionWeights":
+    return cls.from_raw(*WEIGHT_PRESETS[DEFAULT_WEIGHT_PRESET])
+
+  @classmethod
+  def from_ticks(cls, t1: int, t2: int, t3: int) -> "CriterionWeights":
+    return cls.from_raw(float(t1), float(t2), float(t3))
+
+  def to_ticks(self) -> Tuple[int, int, int]:
+    values = list(self.as_tuple())
+    floored = [int(w * 100) for w in values]
+    remainder = 100 - sum(floored)
+    order = sorted(range(3), key=lambda i: (values[i] * 100 - floored[i]), reverse=True)
+    for k in range(max(0, remainder)):
+      floored[order[k % 3]] += 1
+    while sum(floored) > 100:
+      idx = max(range(3), key=lambda i: floored[i])
+      if floored[idx] <= 0:
+        break
+      floored[idx] -= 1
+    return (floored[0], floored[1], floored[2])
+
+  def __post_init__(self) -> None:
+    for name, value in (
+      ("w_potency", self.w_potency),
+      ("w_operativeness", self.w_operativeness),
+      ("w_resource_saving", self.w_resource_saving),
+    ):
+      if value < -1e-12:
+        raise ValueError(f"{name} must be >= 0, got {value}")
+    total = self.w_potency + self.w_operativeness + self.w_resource_saving
+    if abs(total - 1.0) > 1e-9:
+      raise ValueError(f"weights must sum to 1, got {total}")
+
+
+def redistribute_weight_ticks(
+  ticks: Sequence[int],
+  changed_index: int,
+  new_value: int,
+) -> Tuple[int, int, int]:
+  """Keep three integer ticks in [0, 100] summing to 100 after one slider moves."""
+  current = [int(v) for v in ticks]
+  if len(current) != 3:
+    raise ValueError("ticks must have length 3")
+  idx = int(changed_index)
+  if idx not in (0, 1, 2):
+    raise ValueError("changed_index must be 0, 1 or 2")
+  clamped = max(0, min(100, int(new_value)))
+  remaining = 100 - clamped
+  others = [i for i in range(3) if i != idx]
+  other_sum = current[others[0]] + current[others[1]]
+  result = [0, 0, 0]
+  result[idx] = clamped
+  if other_sum <= 0:
+    result[others[0]] = remaining // 2
+    result[others[1]] = remaining - remaining // 2
+  else:
+    first = int(round(remaining * current[others[0]] / other_sum))
+    first = max(0, min(remaining, first))
+    result[others[0]] = first
+    result[others[1]] = remaining - first
+  return (result[0], result[1], result[2])
+
+
+def weights_from_legacy_profile(profile: TargetProfile) -> CriterionWeights:
+  """Map deprecated Max/Certain/Any profile onto a normalized weight simplex."""
+  raw: List[float] = []
+  for target in (profile.potency, profile.operativeness, profile.resource_saving):
+    if target.mode == TargetMode.Max:
+      raw.append(1.0)
+    elif target.mode == TargetMode.Certain:
+      raw.append(max(0.0, float(target.value)))
+    else:
+      raw.append(1.0)
+  return CriterionWeights.from_raw(*raw)
+
+
+def _coerce_weights(profile_or_weights: object) -> CriterionWeights:
+  if isinstance(profile_or_weights, CriterionWeights):
+    return profile_or_weights
+  if isinstance(profile_or_weights, TargetProfile):
+    return weights_from_legacy_profile(profile_or_weights)
+  raise TypeError(
+    "expected CriterionWeights or TargetProfile, "
+    f"got {type(profile_or_weights).__name__}"
+  )
+
+
+def calculate_fitness(
+  triple: EfficiencyTriple,
+  weights: CriterionWeights,
+  penalties: float = 0.0,
+) -> float:
+  """F = w1*P + w2*O + w3*R - Penalties."""
+  return (
+    weights.w_potency * triple.potency
+    + weights.w_operativeness * triple.operativeness
+    + weights.w_resource_saving * triple.resource_saving
+    - max(0.0, float(penalties))
+  )
+
+
 def compute_total_efficiency(layout: InterfaceLayout, registry: FunctionRegistry) -> EfficiencyTriple:
   """
   Equation (1): Total = ∏(corrected forms) × ∏(double-corrected elements).
@@ -155,57 +287,20 @@ def profile_from_slider_weights(w1: float, w2: float, w3: float) -> TargetProfil
 
 def scalar_fitness_from_triple(
   triple: EfficiencyTriple,
-  profile: TargetProfile,
+  profile: object,
   weights: Optional[Sequence[float]] = None,
+  penalties: float = 0.0,
 ) -> float:
+  """Scalar fitness F = w1*P + w2*O + w3*R - Penalties.
+
+  ``profile`` may be ``CriterionWeights`` or a legacy ``TargetProfile``.
+  Optional ``weights`` override as (w_P, w_O, w_R) and are normalized.
   """
-  Kurta-Izrailov scalar fitness for single-objective metaheuristics.
-
-  Max mode: strict per-component isolation (never the triple product).
-  Certain / Any mode: weighted linear projection; optional ``weights`` override
-  profile-derived coefficients as (w_P, w_O, w_R).
-  """
-  max_values: List[float] = []
-  if profile.potency.mode == TargetMode.Max:
-    max_values.append(triple.potency)
-  if profile.operativeness.mode == TargetMode.Max:
-    max_values.append(triple.operativeness)
-  if profile.resource_saving.mode == TargetMode.Max:
-    max_values.append(triple.resource_saving)
-
-  if len(max_values) == 1:
-    return max_values[0]
-  if len(max_values) > 1:
-    return min(max_values)
-
   if weights is not None and len(weights) >= 3:
-    w_p, w_o, w_r = (max(0.0, float(weights[0])), max(0.0, float(weights[1])), max(0.0, float(weights[2])))
-    total_w = w_p + w_o + w_r
-    if total_w <= 0.0:
-      return (triple.potency + triple.operativeness + triple.resource_saving) / 3.0
-    return (
-      w_p * triple.potency + w_o * triple.operativeness + w_r * triple.resource_saving
-    ) / total_w
-
-  coeff: List[float] = []
-  values: List[float] = []
-  for target, value in (
-    (profile.potency, triple.potency),
-    (profile.operativeness, triple.operativeness),
-    (profile.resource_saving, triple.resource_saving),
-  ):
-    if target.mode == TargetMode.Certain:
-      coeff.append(max(1e-9, clamp(target.value, 0.0, 1.0)))
-      values.append(value)
-    elif target.mode == TargetMode.Any:
-      coeff.append(1.0)
-      values.append(value)
-
-  if not coeff:
-    return (triple.potency + triple.operativeness + triple.resource_saving) / 3.0
-
-  total_w = sum(coeff)
-  return sum(w * v for w, v in zip(coeff, values)) / total_w
+    resolved = CriterionWeights.from_raw(weights[0], weights[1], weights[2])
+  else:
+    resolved = _coerce_weights(profile)
+  return calculate_fitness(triple, resolved, penalties=penalties)
 
 
 def profile_constraints_satisfied(triple: EfficiencyTriple, profile: TargetProfile, tol: float = 1e-6) -> bool:
@@ -302,9 +397,11 @@ class DecisionSpace:
 
 
 class ObjectiveEvaluator:
-  def __init__(self, registry: FunctionRegistry, profile: TargetProfile) -> None:
+  def __init__(self, registry: FunctionRegistry, weights: object) -> None:
     self.registry = registry
-    self.profile = profile
+    self.weights = _coerce_weights(weights)
+    # Legacy alias used by older call sites / docs.
+    self.profile = weights if isinstance(weights, TargetProfile) else TargetProfile.balanced()
 
   def evaluate_layout(self, layout: InterfaceLayout) -> EfficiencyTriple:
     return compute_total_efficiency(layout, self.registry)
@@ -314,7 +411,7 @@ class ObjectiveEvaluator:
 
   def scalar_fitness(self, layout: InterfaceLayout) -> float:
     triple = self.evaluate_layout(layout)
-    return scalar_fitness_from_triple(triple, self.profile)
+    return calculate_fitness(triple, self.weights)
 
   def evaluate_vector(self, x: np.ndarray, space: DecisionSpace) -> EfficiencyTriple:
     layout = space.decode_layout(x, self.registry)
@@ -469,13 +566,14 @@ def nsga2(
       EfficiencyTriple(*objectives[i])
       for i in front0
     ]
-    pick = select_from_pareto(triples, evaluator.profile)
+    pick = max(
+      range(len(triples)),
+      key=lambda i: calculate_fitness(triples[i], evaluator.weights),
+    )
     chosen_index = front0[pick]
     best_layout = space.decode_layout(population[chosen_index], evaluator.registry)
     best_triple = EfficiencyTriple(*objectives[chosen_index])
-    history_best_scalar.append(
-      scalar_fitness_from_triple(best_triple, evaluator.profile)
-    )
+    history_best_scalar.append(calculate_fitness(best_triple, evaluator.weights))
     history_best_triple.append(best_triple)
 
   if best_layout is None and population:
@@ -675,7 +773,7 @@ def classic_genetic_algorithm(
   random_seed: int | None = None,
 ) -> Dict[str, object]:
   """
-  Single-objective genetic algorithm using scalar_fitness_from_triple().
+  Single-objective genetic algorithm using calculate_fitness() / CriterionWeights.
 
   Selection: tournament on scalar fitness.
   Variation: SBX crossover + Gaussian mutation on the D + N genome.

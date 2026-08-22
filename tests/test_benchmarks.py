@@ -14,20 +14,55 @@ from optiflow.benchmarks import (
   random_benchmark_snapshot,
   run_optimization_benchmark,
 )
-from optiflow.models.scoring import DataType, FieldSpec, FunctionRegistry
+from optiflow.models.scoring import DataType, EfficiencyTriple, FieldSpec, FunctionRegistry
 from optiflow.optimization.algorithms import (
+  CriterionWeights,
   DecisionSpace,
   ObjectiveEvaluator,
-  ComponentTarget,
-  TargetMode,
-  TargetProfile,
   brute_force,
   brute_force_search_space_size,
+  calculate_fitness,
   classic_genetic_algorithm,
   compute_total_efficiency,
-  profile_constraints_satisfied,
-  profile_from_slider_values,
+  redistribute_weight_ticks,
 )
+
+
+class CriterionWeightsTests(unittest.TestCase):
+  def test_from_raw_normalizes_to_unit_sum(self) -> None:
+    weights = CriterionWeights.from_raw(2.0, 1.0, 1.0)
+    self.assertAlmostEqual(sum(weights.as_tuple()), 1.0)
+    self.assertAlmostEqual(weights.w_potency, 0.5)
+    self.assertAlmostEqual(weights.w_operativeness, 0.25)
+    self.assertAlmostEqual(weights.w_resource_saving, 0.25)
+
+  def test_zero_vector_falls_back_to_equal_weights(self) -> None:
+    weights = CriterionWeights.from_raw(0.0, 0.0, 0.0)
+    self.assertAlmostEqual(sum(weights.as_tuple()), 1.0)
+    for value in weights.as_tuple():
+      self.assertAlmostEqual(value, 1.0 / 3.0)
+
+  def test_rejects_unnormalized_constructor(self) -> None:
+    with self.assertRaises(ValueError):
+      CriterionWeights(0.5, 0.5, 0.5)
+
+  def test_ticks_round_trip_sums_to_100(self) -> None:
+    weights = CriterionWeights.from_raw(0.70, 0.20, 0.10)
+    ticks = weights.to_ticks()
+    self.assertEqual(sum(ticks), 100)
+    restored = CriterionWeights.from_ticks(*ticks)
+    self.assertAlmostEqual(sum(restored.as_tuple()), 1.0)
+
+  def test_redistribute_keeps_unit_simplex(self) -> None:
+    ticks = redistribute_weight_ticks((34, 33, 33), 0, 70)
+    self.assertEqual(sum(ticks), 100)
+    self.assertEqual(ticks[0], 70)
+
+  def test_calculate_fitness_is_weighted_sum_minus_penalties(self) -> None:
+    triple = EfficiencyTriple(0.8, 0.4, 0.2)
+    weights = CriterionWeights.from_raw(0.5, 0.3, 0.2)
+    expected = 0.5 * 0.8 + 0.3 * 0.4 + 0.2 * 0.2 - 0.1
+    self.assertAlmostEqual(calculate_fitness(triple, weights, penalties=0.1), expected)
 
 
 class BruteForceTests(unittest.TestCase):
@@ -37,9 +72,9 @@ class BruteForceTests(unittest.TestCase):
       FieldSpec("B", DataType.UNSIGNED, 2),
     ]
     ensure_allowed_controls(fields)
-    profile = profile_from_slider_values(50, 50, 50)
+    weights = CriterionWeights.from_raw(1.0, 1.0, 1.0)
     space = DecisionSpace(fields, max_forms=2)
-    evaluator = ObjectiveEvaluator(FunctionRegistry(), profile)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
     return space, evaluator
 
   def test_search_space_size(self) -> None:
@@ -75,7 +110,7 @@ class BruteForceTests(unittest.TestCase):
     fields = [FieldSpec(f"F{i}", DataType.TEXT, 10) for i in range(8)]
     ensure_allowed_controls(fields)
     space = DecisionSpace(fields, max_forms=5)
-    evaluator = ObjectiveEvaluator(FunctionRegistry(), TargetProfile.balanced())
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
     self.assertGreater(brute_force_search_space_size(space), 50_000)
     with self.assertRaises(ValueError):
       brute_force(space, evaluator)
@@ -90,8 +125,8 @@ class ClassicGATests(unittest.TestCase):
     ]
     ensure_allowed_controls(fields)
     space = DecisionSpace(fields, max_forms=2)
-    profile = profile_from_slider_values(100, 40, 40)
-    evaluator = ObjectiveEvaluator(FunctionRegistry(), profile)
+    weights = CriterionWeights.from_raw(0.70, 0.20, 0.10)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
     result = classic_genetic_algorithm(space, evaluator, pop_size=12, generations=10, random_seed=7)
     self.assertGreater(float(result["best_score"]), 0.0)
     self.assertEqual(len(result["history"]), 11)
@@ -99,6 +134,11 @@ class ClassicGATests(unittest.TestCase):
     self.assertIsNotNone(layout)
     triple = compute_total_efficiency(layout, evaluator.registry)
     self.assertGreater(triple.potency, 0.0)
+    self.assertAlmostEqual(
+      float(result["best_score"]),
+      calculate_fitness(triple, weights),
+      places=6,
+    )
 
 
 class BenchmarkHelperTests(unittest.TestCase):
@@ -109,6 +149,14 @@ class BenchmarkHelperTests(unittest.TestCase):
   def test_precision_vs_baseline(self) -> None:
     self.assertAlmostEqual(precision_vs_baseline(0.9, 1.0) or 0.0, 0.9)
     self.assertIsNone(precision_vs_baseline(0.5, 0.0))
+
+  def test_random_snapshot_weights_are_normalized(self) -> None:
+    import random
+
+    fields, max_forms, weights = random_benchmark_snapshot(random.Random(7))
+    self.assertGreaterEqual(len(fields), 2)
+    self.assertGreaterEqual(max_forms, 1)
+    self.assertAlmostEqual(sum(weights.as_tuple()), 1.0)
 
 
 class MonteCarloBenchmarkTests(unittest.TestCase):
@@ -135,27 +183,11 @@ class MonteCarloBenchmarkTests(unittest.TestCase):
     ]
     ensure_allowed_controls(fields)
     space = DecisionSpace(fields, max_forms=1)
-    profile = TargetProfile(
-      potency=ComponentTarget(TargetMode.Certain, 0.5),
-      operativeness=ComponentTarget(TargetMode.Any),
-      resource_saving=ComponentTarget(TargetMode.Any),
-    )
-    evaluator = ObjectiveEvaluator(FunctionRegistry(), profile)
+    weights = CriterionWeights.from_raw(0.5, 0.3, 0.2)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
     bf = brute_force(space, evaluator)
     ga = classic_genetic_algorithm(space, evaluator, pop_size=10, generations=15, random_seed=1)
     self.assertGreaterEqual(float(bf["best_score"]), float(ga["best_score"]) - 1e-9)
-
-  def test_constraint_validation_integration(self) -> None:
-    fields = [FieldSpec("Flag", DataType.BOOLEAN, 1)]
-    ensure_allowed_controls(fields)
-    space = DecisionSpace(fields, max_forms=1)
-    profile = profile_from_slider_values(95, 0, 0)
-    evaluator = ObjectiveEvaluator(FunctionRegistry(), profile)
-    result = brute_force(space, evaluator)
-    layout = result["best_layout"]
-    assert layout is not None
-    triple = compute_total_efficiency(layout, evaluator.registry)
-    self.assertIsInstance(profile_constraints_satisfied(triple, profile), bool)
 
 
 class MarkdownFormatTests(unittest.TestCase):
@@ -165,8 +197,6 @@ class MarkdownFormatTests(unittest.TestCase):
     stats = {name: AlgorithmBenchmarkStats() for name in BENCHMARK_ALGORITHMS}
     stats["GA"].precision_rates = [0.95, 0.98]
     stats["GA"].convergence_iterations = [10, 12]
-    stats["GA"].constraint_passes = 2
-    stats["GA"].constraint_total = 2
     stats["GA"].baseline_runs = 2
     md = format_benchmark_markdown(stats, runs_count=2, baseline_computable_runs=2)
     self.assertIn("| GA |", md)

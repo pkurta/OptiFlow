@@ -8,18 +8,15 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from optiflow.models.scoring import DataType, FieldSpec, FunctionRegistry
 from optiflow.optimization.algorithms import (
+  CriterionWeights,
   DecisionSpace,
   ObjectiveEvaluator,
-  TargetProfile,
   aco,
   brute_force,
   brute_force_search_space_size,
   classic_genetic_algorithm,
-  compute_total_efficiency,
   greedy,
   nsga2,
-  profile_constraints_satisfied,
-  profile_from_slider_values,
   pso,
   simulated_annealing,
   tabu_search,
@@ -57,14 +54,20 @@ def ensure_allowed_controls(fields: List[FieldSpec]) -> None:
     setattr(f, "allowed_controls", lambda allowed=allowed: allowed)
 
 
+def random_criterion_weights(rng: random.Random) -> CriterionWeights:
+  """Uniform-ish draw on the simplex w1+w2+w3=1, wi>=0."""
+  draws = [rng.random() for _ in range(3)]
+  return CriterionWeights.from_raw(*draws)
+
+
 def random_benchmark_snapshot(
   rng: random.Random,
   *,
   min_fields: int = 2,
   max_fields: int = 4,
   max_forms_cap: int = 3,
-) -> Tuple[List[FieldSpec], int, TargetProfile]:
-  """Monte Carlo draw: random fields, wizard depth, and TargetProfile sliders."""
+) -> Tuple[List[FieldSpec], int, CriterionWeights]:
+  """Monte Carlo draw: random fields, wizard depth, and normalized criterion weights."""
   n_fields = rng.randint(min_fields, max_fields)
   fields: List[FieldSpec] = []
   for i in range(n_fields):
@@ -73,9 +76,8 @@ def random_benchmark_snapshot(
     fields.append(FieldSpec(name=f"Field{i + 1}", data_type=dtype, size=size))
   ensure_allowed_controls(fields)
   max_forms = rng.randint(1, min(max_forms_cap, max(1, n_fields)))
-  sliders = [rng.randint(0, 100) for _ in range(3)]
-  profile = profile_from_slider_values(*sliders)
-  return fields, max_forms, profile
+  weights = random_criterion_weights(rng)
+  return fields, max_forms, weights
 
 
 def convergence_plateau_iteration(
@@ -165,20 +167,18 @@ def format_benchmark_markdown(
     "",
     f"Monte Carlo runs: **{runs_count}** | Brute-force baseline computable: **{baseline_computable_runs}**",
     "",
-    "| Algorithm | Precision Rate | Convergence (iter) | Constraint Pass Rate | Baseline Samples |",
-    "| --- | ---: | ---: | ---: | ---: |",
+    "| Algorithm | Precision Rate | Convergence (iter) | Baseline Samples |",
+    "| --- | ---: | ---: | ---: |",
   ]
   for name in BENCHMARK_ALGORITHMS:
     stats = stats_by_algorithm[name]
     precision = stats.mean_precision()
     convergence = stats.mean_convergence()
-    constraint = stats.constraint_pass_rate()
     lines.append(
-      "| {name} | {precision} | {convergence} | {constraint} | {baseline} |".format(
+      "| {name} | {precision} | {convergence} | {baseline} |".format(
         name=name,
         precision=f"{precision:.4f}" if precision is not None else "n/a",
         convergence=f"{convergence:.1f}" if convergence is not None else "n/a",
-        constraint=f"{constraint:.2%}" if constraint is not None else "n/a",
         baseline=stats.baseline_runs if name != "BruteForce" else baseline_computable_runs,
       )
     )
@@ -206,9 +206,9 @@ def run_optimization_benchmark(
   baseline_computable_runs = 0
 
   for run_idx in range(runs_count):
-    fields, max_forms, profile = random_benchmark_snapshot(rng)
+    fields, max_forms, weights = random_benchmark_snapshot(rng)
     space = DecisionSpace(fields, max_forms=max_forms)
-    evaluator = ObjectiveEvaluator(registry, profile)
+    evaluator = ObjectiveEvaluator(registry, weights)
     search_size = brute_force_search_space_size(space)
     baseline_score: Optional[float] = None
     bf_ran = False
@@ -223,12 +223,6 @@ def run_optimization_benchmark(
         stats_by_algorithm["BruteForce"].convergence_iterations.append(
           convergence_plateau_iteration(bf_result["history"])
         )
-        bf_layout = bf_result.get("best_layout")
-        if bf_layout is not None:
-          triple = compute_total_efficiency(bf_layout, registry)
-          stats_by_algorithm["BruteForce"].constraint_total += 1
-          if profile_constraints_satisfied(triple, profile):
-            stats_by_algorithm["BruteForce"].constraint_passes += 1
       except ValueError:
         baseline_score = None
 
@@ -240,13 +234,6 @@ def run_optimization_benchmark(
       score = float(result["best_score"])
       history = result.get("history") or [score]
       stats_by_algorithm[name].convergence_iterations.append(convergence_plateau_iteration(history))
-
-      layout = result.get("best_layout")
-      if layout is not None:
-        triple = compute_total_efficiency(layout, registry)
-        stats_by_algorithm[name].constraint_total += 1
-        if profile_constraints_satisfied(triple, profile):
-          stats_by_algorithm[name].constraint_passes += 1
 
       if baseline_score is not None and baseline_score > 0.0:
         prec = precision_vs_baseline(score, baseline_score)
