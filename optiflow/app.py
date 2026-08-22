@@ -218,6 +218,23 @@ if _HAS_PYQT5:
       spin.setValue(size)
       self.setCellWidget(row, 2, spin)
 
+    def next_default_field_name(self) -> str:
+      prefix = "Поле "
+      used = set()
+      for row in range(self.rowCount()):
+        item = self.item(row, 0)
+        if not item:
+          continue
+        name = item.text().strip()
+        if name.startswith(prefix):
+          suffix = name[len(prefix):]
+          if suffix.isdigit():
+            used.add(int(suffix))
+      n = 1
+      while n in used:
+        n += 1
+      return f"{prefix}{n}"
+
     def fields(self) -> List[FieldSpec]:
       result: List[FieldSpec] = []
       for row in range(self.rowCount()):
@@ -487,7 +504,7 @@ if _HAS_PYQT5:
       self.last_best_layouts: Dict[str, Optional[InterfaceLayout]] = {}
 
     def _add_field(self) -> None:
-        self.field_table.add_field("Поле", DataType.TEXT, 16)
+      self.field_table.add_field(self.field_table.next_default_field_name(), DataType.TEXT, 16)
 
     def _remove_selected_field(self) -> None:
       rows = sorted({i.row() for i in self.field_table.selectedIndexes()}, reverse=True)
