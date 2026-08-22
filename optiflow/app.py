@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from optiflow import __version__
 from optiflow.models.scoring import (
   ControlType,
   DataType,
@@ -424,7 +425,7 @@ if _HAS_PYQT5:
   class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
       super().__init__()
-      self.setWindowTitle("OptiFlow")
+      self.setWindowTitle(f"OptiFlow {__version__}")
       self.resize(1100, 800)
       self.registry = FunctionRegistry()
       self.target_profile = TargetProfile.balanced()
