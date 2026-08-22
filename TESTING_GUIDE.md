@@ -10,7 +10,7 @@
 
 ### 1.1. Назначение тестового контура
 
-Автоматизированный тестовый контур OptiFlow предназначен для верификации **математической корректности** оптимизационного движка относительно мультипликативной модели эффективности Kurta-Izrailov (2025). Модель оперирует тройкой показателей `EfficiencyTriple` — **Точность (potency)**, **Оперативность (operativeness)** и **Комфорт (resource_saving)** — и вычисляет суммарную эффективность компоновки интерфейса как **покомпонентное произведение** скорректированных атомарных вкладов форм и элементов управления.
+Автоматизированный тестовый контур OptiFlow предназначен для верификации **математической корректности** оптимизационного движка относительно мультипликативной модели эффективности Kurta-Izrailov (2025). Модель оперирует тройкой показателей `EfficiencyTriple` — **Результативность (potency)**, **Оперативность (operativeness)** и **Ресурсоэкономность (resource_saving)** — и вычисляет суммарную эффективность компоновки интерфейса как **покомпонентное произведение** скорректированных атомарных вкладов форм и элементов управления.
 
 Фундаментальное уравнение (1), реализованное в функции `compute_total_efficiency()` модуля `optiflow/optimization/algorithms.py`:
 
@@ -23,7 +23,7 @@ Total = ∏(corrected forms) × ∏(double-corrected elements)
 Тестовый набор проверяет три уровня соответствия:
 
 1. **Структурная корректность** — декодирование хромосомы `DecisionSpace` (D токенов управления + N весов разбиения) в валидный `InterfaceLayout`.
-2. **Численная корректность** — согласованность скалярной пригодности `scalar_fitness_from_triple()` с `TargetProfile` (режимы Max, Certain, Any).
+2. **Численная корректность** — согласованность скалярной пригодности `calculate_fitness()` с нормированными весами `CriterionWeights` (\(F = w_1 P + w_2 O + w_3 R\)).
 3. **Оптимизационная корректность** — способность эвристик приближаться к абсолютному глобальному максимуму, найденному полным перебором.
 
 ### 1.2. Brute Force как эталон Ground Truth
@@ -41,7 +41,7 @@ Total = ∏(corrected forms) × ∏(double-corrected elements)
 
 где `D = len(fields)`, `N = max(1, max_forms)`.
 
-**Роль эталона:** результат Brute Force (`best_score`, `best_layout`) является **абсолютным глобальным максимумом** скалярной пригодности в рамках заданного `DecisionSpace` и `TargetProfile`. Все метаэвристики (NSGA-II, Classic GA, PSO, Greedy, SA, Tabu, ACO) сравниваются с этим значением при вычислении **Precision Rate**.
+**Роль эталона:** результат Brute Force (`best_score`, `best_layout`) является **абсолютным глобальным максимумом** скалярной пригодности \(F(w)\) в рамках заданного `DecisionSpace` и `CriterionWeights`. Все метаэвристики (NSGA-II, Classic GA, PSO, Greedy, SA, Tabu, ACO) сравниваются с этим значением при вычислении **Precision Rate**.
 
 **Ограничение безопасности:** если `|Ω| > 50 000`, функция `brute_force()` генерирует исключение `ValueError` с пояснением о превышении лимита `BRUTE_FORCE_MAX_COMBINATIONS`. Это предотвращает зависание потока при неконтролируемом росте пространства поиска. В Monte Carlo-бенчмарке такие прогоны помечаются как «baseline не вычислим», и метрика Precision Rate для них не накапливается.
 
@@ -70,18 +70,19 @@ Precision = min(1.0, max(0.0, score_algorithm / score_brute_force))
 
 Возвращается **индекс итерации**, на которой последний раз было зафиксировано улучшение перед плато. Меньшее значение означает более быструю сходимость. Итог — **среднее по прогонам** (`mean_convergence()`).
 
-#### Constraint Pass Rate (коэффициент удержания Certain-ограничений)
+#### Нормировка весов
 
-Для каждого лучшего найденного layout вычисляется `EfficiencyTriple` через `compute_total_efficiency()`, затем проверяется функция `profile_constraints_satisfied()`:
-
-- для каждого измерения `TargetProfile` в режиме `TargetMode.Certain` компонент triple должен совпадать с целевым значением с допуском `tol = 1e-6`;
-- режимы `Max` и `Any` в данной проверке не участвуют.
+Каждый прогон использует `CriterionWeights` с инвариантом \(w_1+w_2+w_3=1\), \(w_i \ge 0\). Целевая функция:
 
 ```
-Constraint Pass Rate = constraint_passes / constraint_total
+F = w1 * P + w2 * O + w3 * R - Penalties
 ```
 
-Итог — доля прогонов, в которых найденное решение **строго удовлетворяет** всем Certain-ограничениям профиля.
+`Penalties` в текущей реализации равны 0: мультипликативные коррекции позиции и шага мастера уже входят в \(P, O, R\).
+
+#### Constraint Pass Rate (снято)
+
+Метрика удержания Certain-ограничений `TargetProfile` больше не используется: целевые пороги P/O/R не являются входом оптимизатора. В отчёте бенчмарка колонка Constraint Pass Rate удалена.
 
 ---
 
@@ -121,14 +122,11 @@ Constraint Pass Rate = constraint_passes / constraint_total
 
 - `max_forms` — случайное целое от 1 до `min(3, n_fields)`, что гарантирует возможность неоднородного разбиения при достаточном числе полей.
 
-**Профиль целей (`TargetProfile`):**
+**Веса критериев (`CriterionWeights`):**
 
-- три случайных значения слайдеров от 0 до 100 преобразуются через `profile_from_slider_values()`:
-  - `0` → режим `Any`;
-  - `1..99` → режим `Certain` с нормализованным значением `v/100`;
-  - `100` → режим `Max`.
+- три случайных неотрицательных числа нормализуются через `CriterionWeights.from_raw()` так, что \(w_1+w_2+w_3=1\).
 
-Таким образом, каждый прогон Monte Carlo тестирует движок на **различных комбинациях типов, размеров, глубины мастера и режимов TargetProfile**, имитируя реальную вариативность входных данных.
+Таким образом, каждый прогон Monte Carlo тестирует движок на **различных комбинациях типов, размеров, глубины мастера и точек симплекса весов**, имитируя реальную вариативность входных данных.
 
 ### 2.3. Хромосома DecisionSpace: разбиение D + N
 
@@ -155,7 +153,7 @@ Constraint Pass Rate = constraint_passes / constraint_total
 | Одна форма мастера (`N = 1`) | `_partition_counts_from_genome()` возвращает `[D]` — все поля на одной форме |
 | Нулевая кардинальность контролов | `brute_force()` использует `range(max(1, c))` — предотвращает пустой `itertools.product` |
 | Превышение 50 000 комбинаций | `brute_force()` → `ValueError`; бенчмарк продолжает прогон без baseline |
-| Certain-ограничения | `profile_constraints_satisfied()` с `tol = 1e-6`; учитываются только компоненты в режиме Certain |
+| Нормировка весов | `CriterionWeights.from_raw()` гарантирует \(w_1+w_2+w_3=1\) |
 
 ### 2.4. Состав алгоритмов в бенчмарке
 
@@ -176,14 +174,15 @@ Constraint Pass Rate = constraint_passes / constraint_total
 
 ### 2.5. Покрытие unit-тестами
 
-Файл `tests/test_benchmarks.py` содержит пять тестовых классов:
+Файл `tests/test_benchmarks.py` содержит шесть тестовых классов:
 
 | Класс | Тесты | Что проверяется |
 | --- | --- | --- |
+| `CriterionWeightsTests` | 6 | нормировка весов, инвариант суммы 1, фитнес \(F=w\cdot E-\mathrm{Pen}\) |
 | `BruteForceTests` | 3 | размер пространства, глобальный максимум, `ValueError` при превышении лимита |
-| `ClassicGATests` | 1 | корректный возврат layout, history, положительная пригодность |
-| `BenchmarkHelperTests` | 2 | детекция плато, формула precision |
-| `MonteCarloBenchmarkTests` | 3 | интеграционный бенчмарк, GA ≤ BF на малом пространстве, constraint validation |
+| `ClassicGATests` | 1 | корректный возврат layout, history, согласие `best_score` с `calculate_fitness` |
+| `BenchmarkHelperTests` | 3 | детекция плато, формула precision, случайный симплекс весов |
+| `MonteCarloBenchmarkTests` | 2 | интеграционный бенчмарк, GA ≤ BF на малом пространстве |
 | `MarkdownFormatTests` | 1 | корректность форматирования таблицы отчёта |
 
 ---
@@ -326,16 +325,16 @@ python3 run_benchmark.py
 
 Monte Carlo runs: **100** | Brute-force baseline computable: **87**
 
-| Algorithm | Precision Rate | Convergence (iter) | Constraint Pass Rate | Baseline Samples |
-| --- | ---: | ---: | ---: | ---: |
-| BruteForce | 1.0000 | 5.2 | 42.53% | 87 |
-| NSGA-II | 0.9612 | 14.8 | 38.00% | 87 |
-| GA | 0.9534 | 11.3 | 37.00% | 87 |
-| PSO | 0.9287 | 18.6 | 35.00% | 87 |
-| Greedy | 0.8712 | 1.0 | 29.00% | 87 |
-| SA | 0.9023 | 22.4 | 33.00% | 87 |
-| Tabu | 0.8891 | 12.7 | 31.00% | 87 |
-| ACO | 0.8456 | 16.2 | 28.00% | 87 |
+| Algorithm | Precision Rate | Convergence (iter) | Baseline Samples |
+| --- | ---: | ---: | ---: |
+| BruteForce | 1.0000 | 5.2 | 87 |
+| NSGA-II | 0.9612 | 14.8 | 87 |
+| GA | 0.9534 | 11.3 | 87 |
+| PSO | 0.9287 | 18.6 | 87 |
+| Greedy | 0.8712 | 1.0 | 87 |
+| SA | 0.9023 | 22.4 | 87 |
+| Tabu | 0.8891 | 12.7 | 87 |
+| ACO | 0.8456 | 16.2 | 87 |
 ```
 
 > **Примечание:** числовые значения в примере выше иллюстративны и служат образцом формата. Реальные значения зависят от `random_seed` и аппаратного времени выполнения.
@@ -344,16 +343,16 @@ Monte Carlo runs: **100** | Brute-force baseline computable: **87**
 
 Для внутренней отчётности рекомендуется транслировать метрики в следующую форму:
 
-| Алгоритм | Средняя точность (Precision) | Скорость сходимости (итерации до плато) | Удержание ограничений (Certain) | Выборок baseline |
-| --- | ---: | ---: | ---: | ---: |
-| BruteForce | 1.0000 | 5.2 | 42.53% | 87 |
-| NSGA-II | 0.9612 | 14.8 | 38.00% | 87 |
-| **GA (Classic)** | **0.9534** | **11.3** | **37.00%** | **87** |
-| PSO | 0.9287 | 18.6 | 35.00% | 87 |
-| Greedy | 0.8712 | 1.0 | 29.00% | 87 |
-| SA | 0.9023 | 22.4 | 33.00% | 87 |
-| Tabu | 0.8891 | 12.7 | 31.00% | 87 |
-| ACO | 0.8456 | 16.2 | 28.00% | 87 |
+| Алгоритм | Средняя точность (Precision) | Скорость сходимости (итерации до плато) | Выборок baseline |
+| --- | ---: | ---: | ---: |
+| BruteForce | 1.0000 | 5.2 | 87 |
+| NSGA-II | 0.9612 | 14.8 | 87 |
+| **GA (Classic)** | **0.9534** | **11.3** | **87** |
+| PSO | 0.9287 | 18.6 | 87 |
+| Greedy | 0.8712 | 1.0 | 87 |
+| SA | 0.9023 | 22.4 | 87 |
+| Tabu | 0.8891 | 12.7 | 87 |
+| ACO | 0.8456 | 16.2 | 87 |
 
 **Строка заголовка отчёта** содержит два контрольных числа:
 
@@ -381,11 +380,10 @@ Unit-тест `test_benchmark_brute_force_beats_or_matches_metaheuristics_on_tin
 - SA и PSO, как правило, имеют более высокие значения из-за длинных циклов (`iterations=120` и `iterations=30` соответственно).
 - Classic GA с SBX и Gaussian mutation обычно сходится за 10–15 итераций на типичных снимках.
 
-#### Constraint Pass Rate (Удержание Certain-ограничений)
+#### Веса критериев
 
-- Значение показывает, как часто **лучшее найденное решение** удовлетворяет Certain-целям `TargetProfile`.
-- Низкий процент **не означает ошибку алгоритма**: при случайных слайдерах Certain-режим может быть физически недостижим для данной комбинации полей и контролов.
-- Для целенаправленной проверки constraint validation используйте тест `test_constraint_validation_integration`, где профиль задаёт `potency=Certain(0.95)`.
+- Вход оптимизатора — `CriterionWeights`, а не целевые значения P, O, R.
+- Unit-тесты `CriterionWeightsTests` проверяют \(\sum w_i = 1\) и формулу \(F = w_1 P + w_2 O + w_3 R - \mathrm{Penalties}\).
 
 ### 4.4. Пошаговая процедура верификации релиза
 
@@ -395,7 +393,7 @@ Unit-тест `test_benchmark_brute_force_beats_or_matches_metaheuristics_on_tin
    python3 -m unittest tests.test_benchmarks -v
    ```
 
-   Убедиться: `Ran 10 tests` → `OK`, ноль ошибок и провалов.
+   Убедиться: `Ran 16 tests` → `OK`, ноль ошибок и провалов.
 
 2. **Запустить полный бенчмарк:**
 
@@ -429,7 +427,7 @@ Unit-тест `test_benchmark_brute_force_beats_or_matches_metaheuristics_on_tin
 | `Precision Rate = n/a` | Ни один прогон не имел вычислимого baseline | См. выше |
 | `ImportError: No module named optiflow` | Запуск не из корня репозитория | Выполнить `cd` в корень проекта или установить пакет editable: `pip install -e .` |
 | GA Precision < 0.95 стабильно | Недостаточно поколений или высокая стохастичность профилей | Увеличить `generations` в `_run_algorithm()` или `runs_count` для усреднения |
-| Unit-тест `test_brute_force_finds_global_maximum` падает | Регрессия в `brute_force()` или `scalar_fitness_from_triple()` | Сравнить `best_score` с независимым перебором в теле теста |
+| Unit-тест `test_brute_force_finds_global_maximum` падает | Регрессия в `brute_force()` или `calculate_fitness()` | Сравнить `best_score` с независимым перебором в теле теста |
 
 ### 4.6. Связь отчёта с экспортом интерфейса
 
@@ -451,7 +449,7 @@ Headless-режим (`run_headless_cli()`) генерирует два арте�
 | `BRUTE_FORCE_MAX_COMBINATIONS` | `50 000` | `algorithms.py` |
 | `epsilon` (convergence) | `1e-6` | `benchmarks.py` |
 | `patience` (convergence) | `3` | `benchmarks.py` |
-| `tol` (Certain constraints) | `1e-6` | `algorithms.py` |
+| `calculate_fitness` | \(F=w_1P+w_2O+w_3R-\mathrm{Pen}\) | `algorithms.py` |
 | `runs_count` (default) | `100` | `benchmarks.py` |
 | `random_seed` (default) | `42` | `benchmarks.py` |
 
