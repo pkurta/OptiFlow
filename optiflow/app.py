@@ -17,23 +17,23 @@ from optiflow.models.scoring import (
   build_interface_layout,
 )
 from optiflow.optimization.algorithms import (
+  CUSTOM_WEIGHT_PRESET,
+  CriterionWeights,
+  DEFAULT_WEIGHT_PRESET,
   DecisionSpace,
   ObjectiveEvaluator,
-  ComponentTarget,
-  TargetMode,
-  TargetProfile,
+  WEIGHT_PRESETS,
   aco,
   brute_force,
+  calculate_fitness,
   classic_genetic_algorithm,
   compute_total_efficiency,
   greedy,
   hill_climb,
   nsga2,
-  profile_constraints_satisfied,
-  profile_from_slider_values,
   pso,
   random_search,
-  scalar_fitness_from_triple,
+  redistribute_weight_ticks,
   simulated_annealing,
   tabu_search,
 )
@@ -94,11 +94,6 @@ except ImportError:
   _HAS_PYQT5 = False
 
 
-def normalize_weights(a: float, b: float, c: float) -> Tuple[float, float, float]:
-  s = max(1e-9, a + b + c)
-  return (a / s, b / s, c / s)
-
-
 def _allowed_controls_for_field(field: FieldSpec) -> List[ControlType]:
   """
   `DecisionSpace` expects each field to provide `allowed_controls()`.
@@ -122,80 +117,204 @@ def _ensure_allowed_controls(fields: List[FieldSpec]) -> None:
     setattr(f, "allowed_controls", lambda allowed=allowed: allowed)
 
 
-_MODE_LABELS = {
-  TargetMode.Max: "Макс.",
-  TargetMode.Certain: "Целевое",
-  TargetMode.Any: "Любое",
-}
-
-_DIM_NAMES = ("Точность", "Оперативность", "Комфорт")
+_DIM_NAMES = ("Результативность", "Оперативность", "Ресурсоэкономность")
+_DIM_WEIGHT_LABELS = (
+  "Вес результативности",
+  "Вес оперативности",
+  "Вес ресурсоэкономности",
+)
 
 
 if _HAS_PYQT5:
 
-  class CoefficientSliders(QtWidgets.QWidget):
-    """Sliders drive TargetProfile modes:
-    - 100 maps to TargetMode.Max
-    - anything below 100 maps to TargetMode.Certain with value in [0..1]
-    """
+  class _CommitSlider(QtWidgets.QSlider):
+    """macOS native QSlider fires sliderReleased while dragging; bind commit to real mouse up."""
+
+    gestureStarted = QtCore.pyqtSignal()
+    gestureFinished = QtCore.pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+      super().__init__(QtCore.Qt.Horizontal, parent)
+      fusion = QtWidgets.QStyleFactory.create("Fusion")
+      if fusion is not None:
+        self.setStyle(fusion)
+      self.setRange(0, 100)
+      self.setTracking(True)
+      self.setFocusPolicy(QtCore.Qt.StrongFocus)
+      self._mouse_down = False
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+      if event.button() == QtCore.Qt.LeftButton:
+        self._mouse_down = True
+        self.gestureStarted.emit()
+      super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:
+      super().mouseReleaseEvent(event)
+      if event.button() == QtCore.Qt.LeftButton and self._mouse_down:
+        self._mouse_down = False
+        self.gestureFinished.emit()
+
+    def is_mouse_down(self) -> bool:
+      return self._mouse_down
+
+
+  class WeightSliders(QtWidgets.QWidget):
+    """During a drag only the active slider moves; others snap once on mouse-up or focus-out."""
+
     changed = QtCore.pyqtSignal(object)
 
     def __init__(self, parent=None) -> None:
       super().__init__(parent)
+      self._updating = False
+      self._pending_index: Optional[int] = None
+      self._frozen_ticks: Optional[List[int]] = None
       layout = QtWidgets.QGridLayout(self)
-      self.s1 = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-      self.s2 = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-      self.s3 = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-      for s in (self.s1, self.s2, self.s3):
-        s.setRange(0, 100)
-        s.setValue(33)
-        s.valueChanged.connect(self._on_slider_changed)
-      self.l1 = QtWidgets.QLabel("")
-      self.l2 = QtWidgets.QLabel("")
-      self.l3 = QtWidgets.QLabel("")
-      layout.addWidget(self.l1, 0, 0)
-      layout.addWidget(self.s1, 0, 1)
-      layout.addWidget(self.l2, 1, 0)
-      layout.addWidget(self.s2, 1, 1)
-      layout.addWidget(self.l3, 2, 0)
-      layout.addWidget(self.s3, 2, 1)
-      self._on_slider_changed()
+      layout.setContentsMargins(0, 0, 0, 0)
+      layout.setColumnStretch(1, 1)
 
-    @staticmethod
-    def _component_from_slider(raw_value: int) -> ComponentTarget:
-      if raw_value >= 100:
-        return ComponentTarget(TargetMode.Max, 1.0)
-      return ComponentTarget(TargetMode.Certain, float(raw_value) / 100.0)
+      self.preset_combo = QtWidgets.QComboBox()
+      self.preset_combo.addItems([*WEIGHT_PRESETS.keys(), CUSTOM_WEIGHT_PRESET])
+      longest = max([*WEIGHT_PRESETS.keys(), CUSTOM_WEIGHT_PRESET], key=len)
+      self.preset_combo.setMinimumContentsLength(len(longest))
+      self.preset_combo.setSizeAdjustPolicy(QtWidgets.QComboBox.AdjustToMinimumContentsLengthWithIcon)
+      layout.addWidget(QtWidgets.QLabel("Сценарий приоритетов:"), 0, 0)
+      layout.addWidget(self.preset_combo, 0, 1)
+      self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
 
-    @staticmethod
-    def _dimension_label(mode: TargetMode, dim_name: str, normalized_value: float) -> str:
-      if mode == TargetMode.Max:
-        return f"Макс. [{dim_name}]"
-      if mode == TargetMode.Certain:
-        return f"Целевое: {normalized_value:.2f} [{dim_name}]"
-      return f"{_MODE_LABELS[mode]} [{dim_name}]"
+      self.sliders: List[_CommitSlider] = []
+      self.labels: List[QtWidgets.QLabel] = []
+      label_width = self.fontMetrics().horizontalAdvance("Вес ресурсоэкономности: 1.00") + 12
+      for row, _name in enumerate(_DIM_NAMES, start=1):
+        lbl = QtWidgets.QLabel()
+        lbl.setMinimumWidth(label_width)
+        lbl.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
+        slider = _CommitSlider(self)
+        slider.valueChanged.connect(self._on_slider_changed)
+        slider.gestureStarted.connect(self._on_gesture_started)
+        slider.gestureFinished.connect(self._on_gesture_finished)
+        slider.installEventFilter(self)
+        layout.addWidget(lbl, row, 0)
+        layout.addWidget(slider, row, 1)
+        self.labels.append(lbl)
+        self.sliders.append(slider)
+
+      self.sum_label = QtWidgets.QLabel("Сумма весов: 1.00")
+      layout.addWidget(self.sum_label, 4, 0, 1, 2)
+
+      self.preset_combo.setCurrentText(DEFAULT_WEIGHT_PRESET)
+      self.set_weights(CriterionWeights.balanced(), mark_custom=False)
+
+    def eventFilter(self, obj: QtCore.QObject, event: QtCore.QEvent) -> bool:
+      if obj in self.sliders and event.type() == QtCore.QEvent.FocusOut:
+        QtCore.QTimer.singleShot(0, self._commit_if_focus_left)
+      return super().eventFilter(obj, event)
+
+    def _is_dragging(self) -> bool:
+      if QtWidgets.QApplication.mouseButtons() & QtCore.Qt.LeftButton:
+        return True
+      return any(s.is_mouse_down() for s in self.sliders)
+
+    def weights(self) -> CriterionWeights:
+      return CriterionWeights.from_ticks(*(s.value() for s in self.sliders))
+
+    def set_weights(self, weights: CriterionWeights, *, mark_custom: bool = True) -> None:
+      self._pending_index = None
+      self._frozen_ticks = None
+      ticks = weights.to_ticks()
+      self._updating = True
+      for slider, tick in zip(self.sliders, ticks):
+        slider.setValue(tick)
+      self._updating = False
+      if mark_custom:
+        self._mark_custom_preset()
+      self._refresh_all_labels()
+
+    def commit(self) -> None:
+      if self._updating or self._is_dragging():
+        return
+      ticks = [s.value() for s in self.sliders]
+      idx = self._pending_index
+      if self._frozen_ticks is not None and idx is not None:
+        ticks = list(self._frozen_ticks)
+        ticks[idx] = self.sliders[idx].value()
+      if idx is None:
+        if sum(ticks) == 100:
+          self._frozen_ticks = None
+          return
+        redistributed = CriterionWeights.from_ticks(*ticks).to_ticks()
+      else:
+        redistributed = redistribute_weight_ticks(ticks, idx, ticks[idx])
+      self._pending_index = None
+      self._frozen_ticks = None
+      if tuple(s.value() for s in self.sliders) != tuple(redistributed):
+        self._updating = True
+        for slider, tick in zip(self.sliders, redistributed):
+          if slider.value() != tick:
+            slider.setValue(tick)
+        self._updating = False
+        self._mark_custom_preset()
+      self._refresh_all_labels()
+      self.changed.emit(self.weights())
+
+    def _mark_custom_preset(self) -> None:
+      if self.preset_combo.currentText() == CUSTOM_WEIGHT_PRESET:
+        return
+      self.preset_combo.blockSignals(True)
+      self.preset_combo.setCurrentText(CUSTOM_WEIGHT_PRESET)
+      self.preset_combo.blockSignals(False)
+
+    def _commit_if_focus_left(self) -> None:
+      if self._is_dragging():
+        return
+      focus = QtWidgets.QApplication.focusWidget()
+      if focus in self.sliders or focus is self.preset_combo:
+        return
+      self.commit()
+
+    def _on_preset_changed(self, name: str) -> None:
+      if name == CUSTOM_WEIGHT_PRESET or name not in WEIGHT_PRESETS:
+        return
+      self.set_weights(CriterionWeights.from_raw(*WEIGHT_PRESETS[name]), mark_custom=False)
+      self.changed.emit(self.weights())
+
+    def _on_gesture_started(self) -> None:
+      sender = self.sender()
+      if sender not in self.sliders:
+        return
+      idx = self.sliders.index(sender)
+      if self._pending_index is not None and self._pending_index != idx:
+        self.commit()
+      self._pending_index = idx
+      self._frozen_ticks = [s.value() for s in self.sliders]
+
+    def _on_gesture_finished(self) -> None:
+      self.commit()
 
     def _on_slider_changed(self) -> None:
-      v1, v2, v3 = self.s1.value(), self.s2.value(), self.s3.value()
+      if self._updating:
+        return
+      sender = self.sender()
+      if sender not in self.sliders:
+        return
+      idx = self.sliders.index(sender)
+      self._pending_index = idx
+      if self._frozen_ticks is not None:
+        self._updating = True
+        for other, frozen in enumerate(self._frozen_ticks):
+          if other != idx and self.sliders[other].value() != frozen:
+            self.sliders[other].setValue(frozen)
+        self._updating = False
+      self._refresh_label(idx)
 
-      profile = TargetProfile(
-        potency=self._component_from_slider(v1),
-        operativeness=self._component_from_slider(v2),
-        resource_saving=self._component_from_slider(v3),
-      )
+    def _refresh_label(self, index: int) -> None:
+      tick = self.sliders[index].value()
+      self.labels[index].setText(f"{_DIM_WEIGHT_LABELS[index]}: {tick / 100.0:.2f}")
 
-      self.l1.setText(self._dimension_label(profile.potency.mode, _DIM_NAMES[0], profile.potency.value))
-      self.l2.setText(self._dimension_label(profile.operativeness.mode, _DIM_NAMES[1], profile.operativeness.value))
-      self.l3.setText(self._dimension_label(profile.resource_saving.mode, _DIM_NAMES[2], profile.resource_saving.value))
-      self.changed.emit(profile)
-
-    def profile(self) -> TargetProfile:
-      v1, v2, v3 = self.s1.value(), self.s2.value(), self.s3.value()
-      return TargetProfile(
-        potency=self._component_from_slider(v1),
-        operativeness=self._component_from_slider(v2),
-        resource_saving=self._component_from_slider(v3),
-      )
+    def _refresh_all_labels(self) -> None:
+      for index in range(len(self.sliders)):
+        self._refresh_label(index)
+      self.sum_label.setText("Сумма весов: 1.00")
 
 
   class FieldTable(QtWidgets.QTableWidget):
@@ -426,17 +545,47 @@ if _HAS_PYQT5:
       self.canvas = FigureCanvas(self.figure)
       layout = QtWidgets.QVBoxLayout(self)
       layout.addWidget(self.canvas)
+      self.results_label = QtWidgets.QLabel(
+        "Запустите алгоритмы, чтобы увидеть расчётные P, O, R выбранных решений."
+      )
+      self.results_label.setWordWrap(True)
+      self.results_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+      layout.addWidget(self.results_label)
 
     def plot_histories(self, histories: List[Tuple[str, List[float]]]) -> None:
       self.figure.clear()
       ax = self.figure.add_subplot(111)
       for label, history in histories:
         ax.plot(history, label=label)
-      ax.set_title("Сравнение (скалярная пригодность TargetProfile)")
+      ax.set_title("Сравнение (скалярная пригодность F = w₁P + w₂O + w₃R)")
       ax.set_xlabel("Итерации")
-      ax.set_ylabel("Скалярная пригодность")
+      ax.set_ylabel("Скалярная пригодность F")
       ax.legend()
       self.canvas.draw_idle()
+
+    def show_results(
+      self,
+      weights: CriterionWeights,
+      rows: List[Tuple[str, Optional[EfficiencyTriple], float, int]],
+    ) -> None:
+      w1, w2, w3 = weights.as_tuple()
+      lines = [
+        (
+          f"Веса (вход): w₁ результативность={w1:.2f}, "
+          f"w₂ оперативность={w2:.2f}, w₃ ресурсоэкономность={w3:.2f} "
+          f"(Σ={w1 + w2 + w3:.2f})"
+        ),
+        "Эффективность сгенерированного интерфейса (выход):",
+      ]
+      for name, triple, fitness, form_count in rows:
+        if triple is None:
+          lines.append(f"• {name}: нет решения")
+          continue
+        lines.append(
+          f"• {name}: P={triple.potency:.3f}, O={triple.operativeness:.3f}, "
+          f"R={triple.resource_saving:.3f}, F={fitness:.3f}, экранов={form_count}"
+        )
+      self.results_label.setText("\n".join(lines))
 
 
   class MainWindow(QtWidgets.QMainWindow):
@@ -445,7 +594,7 @@ if _HAS_PYQT5:
       self.setWindowTitle(f"OptiFlow {__version__}")
       self.resize(1100, 800)
       self.registry = FunctionRegistry()
-      self.target_profile = TargetProfile.balanced()
+      self.weights = CriterionWeights.balanced()
       self.max_forms = 3
 
       tabs = QtWidgets.QTabWidget()
@@ -466,21 +615,31 @@ if _HAS_PYQT5:
 
       form_row = QtWidgets.QHBoxLayout()
       data_layout.addLayout(form_row)
-      form_row.addWidget(QtWidgets.QLabel("Макс. число форм мастера (N):"))
+      form_row.addWidget(QtWidgets.QLabel("Макс. число экранов мастера (N):"))
       self.max_forms_spin = QtWidgets.QSpinBox()
       self.max_forms_spin.setRange(1, 12)
       self.max_forms_spin.setValue(self.max_forms)
       self.max_forms_spin.valueChanged.connect(self._set_max_forms)
       form_row.addWidget(self.max_forms_spin)
+      form_hint = QtWidgets.QLabel(
+        "N задаёт, на сколько экранов алгоритм может распределить контролы."
+      )
+      form_hint.setWordWrap(True)
+      data_layout.addWidget(form_hint)
 
-      self.coef = CoefficientSliders()
-      self.coef.changed.connect(self._set_profile)
-      data_layout.addWidget(self.coef)
+      weights_box = QtWidgets.QGroupBox("Приоритеты оптимизации")
+      weights_layout = QtWidgets.QVBoxLayout(weights_box)
+      self.coef = WeightSliders()
+      self.weights = self.coef.weights()
+      self.coef.changed.connect(self._set_weights)
+      weights_layout.addWidget(self.coef)
       hint = QtWidgets.QLabel(
-        "Ползунки задают режимы TargetProfile (Макс./Целевое); N ограничивает разбиение мастера."
+        "P, O и R — расчётные свойства готового интерфейса, не вход. "
+        "Здесь задаются только веса свёртки F = w₁P + w₂O + w₃R, сумма всегда равна 1."
       )
       hint.setWordWrap(True)
-      data_layout.addWidget(hint)
+      weights_layout.addWidget(hint)
+      data_layout.addWidget(weights_box)
 
       self.task_tab = FunctionEditor(self.registry)
       self.alg_tab = AlgorithmsTab()
@@ -511,17 +670,19 @@ if _HAS_PYQT5:
       for r in rows:
         self.field_table.removeRow(r)
 
-    def _set_profile(self, profile: TargetProfile) -> None:
-      self.target_profile = profile
+    def _set_weights(self, weights: CriterionWeights) -> None:
+      self.weights = weights
 
     def _set_max_forms(self, value: int) -> None:
       self.max_forms = int(value)
 
     def _build_space(self) -> Tuple[DecisionSpace, ObjectiveEvaluator]:
+      self.coef.commit()
+      self.weights = self.coef.weights()
       fields = self.field_table.fields()
       _ensure_allowed_controls(fields)
       space = DecisionSpace(fields, max_forms=self.max_forms)
-      evaluator = ObjectiveEvaluator(self.registry, self.target_profile)
+      evaluator = ObjectiveEvaluator(self.registry, self.weights)
       return space, evaluator
 
     def run_algorithms(self) -> None:
@@ -627,6 +788,16 @@ if _HAS_PYQT5:
         "ACO": res_aco.get("best_layout"),
       }
 
+      result_rows: List[Tuple[str, Optional[EfficiencyTriple], float, int]] = []
+      for name, layout in self.last_best_layouts.items():
+        if layout is None:
+          result_rows.append((name, None, 0.0, 0))
+          continue
+        triple = compute_total_efficiency(layout, self.registry)
+        fitness = calculate_fitness(triple, self.weights)
+        result_rows.append((name, triple, fitness, layout.form_count))
+      self.charts_tab.show_results(self.weights, result_rows)
+
     def export_web(self) -> None:
       layout: Optional[InterfaceLayout] = None
       preferred = self.alg_tab.current_algorithm()
@@ -709,13 +880,12 @@ def mock_demo_fields() -> List[FieldSpec]:
 def _rank_layout_candidate(
   triple: EfficiencyTriple,
   layout: InterfaceLayout,
-  profile: TargetProfile,
-) -> Tuple[int, int, float]:
-  """Prefer profile-feasible, then multi-step wizard, then scalar fitness."""
-  constraints_ok = int(profile_constraints_satisfied(triple, profile))
+  weights: CriterionWeights,
+) -> Tuple[int, float]:
+  """Prefer a multi-step wizard, then weighted scalar fitness."""
   multistep = int(layout.form_count > 1)
-  fitness = scalar_fitness_from_triple(triple, profile)
-  return (constraints_ok, multistep, fitness)
+  fitness = calculate_fitness(triple, weights)
+  return (multistep, fitness)
 
 
 def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
@@ -723,10 +893,9 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
   registry = FunctionRegistry()
   fields = mock_demo_fields()
   max_forms = 3
-  # Default: target MAX for Operativeness.
-  profile = profile_from_slider_values(40, 100, 40)
+  weights = CriterionWeights.from_raw(*WEIGHT_PRESETS["Call-центр / МЧС — упор на оперативность"])
   space = DecisionSpace(fields, max_forms=max_forms)
-  evaluator = ObjectiveEvaluator(registry, profile)
+  evaluator = ObjectiveEvaluator(registry, weights)
 
   algorithm_runs: List[Tuple[str, Dict[str, object]]] = [
     ("NSGA-II", nsga2(space, evaluator, pop_size=30, generations=25, random_seed=42)),
@@ -737,14 +906,14 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
   best_name = ""
   best_layout: Optional[InterfaceLayout] = None
   best_triple = None
-  best_rank: Tuple[int, int, float] = (-1, -1, -1.0)
+  best_rank: Tuple[int, float] = (-1, -1.0)
 
   for name, result in algorithm_runs:
     layout = result.get("best_layout")
     if layout is None:
       continue
     triple = compute_total_efficiency(layout, registry)
-    rank = _rank_layout_candidate(triple, layout, profile)
+    rank = _rank_layout_candidate(triple, layout, weights)
     if rank > best_rank:
       best_rank = rank
       best_name = name
@@ -761,11 +930,10 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
     forced_form_idx = space.counts_to_form_indices(forced_counts)
     best_layout = build_interface_layout(fields, controls, forced_form_idx)
     best_triple = compute_total_efficiency(best_layout, registry)
-    forced_fitness = scalar_fitness_from_triple(best_triple, profile)
-    best_rank = (best_rank[0], 1, forced_fitness)
+    best_rank = (1, calculate_fitness(best_triple, weights))
     best_name = f"{best_name or 'forced'}-multi"
 
-  best_fitness = best_rank[2]
+  best_fitness = best_rank[1]
 
   if best_layout is None:
     controls = [f.allowed_controls()[0] for f in fields]
@@ -780,15 +948,15 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
     form_idx = space.counts_to_form_indices(counts)
     best_layout = build_interface_layout(fields, controls, form_idx)
     best_triple = compute_total_efficiency(best_layout, registry)
-    best_fitness = scalar_fitness_from_triple(best_triple, profile)
+    best_fitness = calculate_fitness(best_triple, weights)
     best_name = "fallback"
 
   assert best_layout is not None and best_triple is not None
-  constraints_ok = profile_constraints_satisfied(best_triple, profile)
+  w1, w2, w3 = weights.as_tuple()
   print(
-    f"[{best_name}] scalar fitness={best_fitness:.4f} "
+    f"[{best_name}] F={best_fitness:.4f} "
     f"P={best_triple.potency:.3f} O={best_triple.operativeness:.3f} R={best_triple.resource_saving:.3f} "
-    f"forms={best_layout.form_count} constraints_ok={constraints_ok}"
+    f"weights=({w1:.2f},{w2:.2f},{w3:.2f}) forms={best_layout.form_count}"
   )
 
   html = generate_html_from_layout(best_layout)
