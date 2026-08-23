@@ -1,0 +1,54 @@
+{
+  "format": "optiflow-task-settings",
+  "version": 2,
+  "optiflow_version": "1.4",
+  "meta_source": "Курта П.А. Система статистического измерения атомарной эффективности графических элементов интерфейсов // Труды учебных заведений связи. 2024. Т. 10. № 6. С. 99-110.",
+  "control_functions": {
+    "TEXTBOX": "if dtype == DataType.TEXT:\n    # Рис. 9a — длина строки L_D = size (1…10)\n    tbl_p = {1: 1.00, 2: 1.00, 3: 1.00, 4: 1.00, 5: 0.83, 6: 0.59, 7: 0.51, 8: 0.33, 9: 0.31, 10: 0.25}\n    tbl_o = {1: 1.00, 2: 0.67, 3: 0.50, 4: 0.36, 5: 0.33, 6: 0.29, 7: 0.19, 8: 0.17, 9: 0.11, 10: 0.01}\n    tbl_r = {1: 1.00, 2: 0.94, 3: 0.89, 4: 0.82, 5: 0.75, 6: 0.66, 7: 0.57, 8: 0.47, 9: 0.36, 10: 0.25}\n    sz = max(1, min(10, int(size)))\n    if size <= 10:\n        p, o, r = tbl_p[sz], tbl_o[sz], tbl_r[sz]\n    else:\n        p = max(0.05, 0.25 - 0.02 * (size - 10))\n        o = 0.01\n        r = max(0.05, 0.25 - 0.02 * (size - 10))\nelse:\n    p, o, r = 0.50, 0.50, 0.50\n",
+    "DROPDOWNLIST": "if dtype in (DataType.TEXT, DataType.UNSIGNED):\n    # Рис. 9b — число элементов M = size (монотонное убывание P, O, R)\n    tbl_p = {1: 1.00, 2: 1.00, 3: 0.83, 4: 0.77, 5: 0.72, 6: 0.56, 7: 0.50, 8: 0.40, 9: 0.36, 10: 0.33}\n    tbl_o = {1: 1.00, 2: 0.50, 3: 0.33, 4: 0.25, 5: 0.25, 6: 0.25, 7: 0.22, 8: 0.20, 9: 0.13, 10: 0.07}\n    tbl_r = {1: 1.00, 2: 0.91, 3: 0.83, 4: 0.73, 5: 0.63, 6: 0.52, 7: 0.39, 8: 0.27, 9: 0.13, 10: 0.01}\n    sz = max(1, min(10, int(size)))\n    if size <= 10:\n        p, o, r = tbl_p[sz], tbl_o[sz], tbl_r[sz]\n    else:\n        p = max(0.10, 0.33 - 0.02 * (size - 10))\n        o = max(0.02, 0.07 - 0.005 * (size - 10))\n        r = 0.01\nelse:\n    p, o, r = 0.50, 0.50, 0.50\n",
+    "CHECKBOX": "if dtype == DataType.BOOLEAN:\n    # Таблица 4.4 — бинарный выбор\n    p, o, r = 0.99, 0.97, 0.96\nelse:\n    p, o, r = 0.50, 0.50, 0.50\n",
+    "SPINNER": "if dtype == DataType.UNSIGNED:\n    # Двунаправленный счётчик: высокая эффективность при малом диапазоне Δ\n    if size <= 3:\n        p, o, r = 0.96, 0.90, 0.91\n    elif size <= 7:\n        p, o, r = 0.88, 0.65, 0.72\n    else:\n        p, o, r = 0.75, 0.35, 0.50\nelse:\n    p, o, r = 0.50, 0.50, 0.50\n",
+    "SLIDER": "if dtype == DataType.UNSIGNED:\n    # Ползунок: стабильно высокая оперативность на средних и больших диапазонах\n    if size <= 5:\n        p, o, r = 0.92, 0.93, 0.90\n    elif size <= 15:\n        p, o, r = 0.88, 0.90, 0.82\n    else:\n        p, o, r = 0.84, 0.85, 0.75\nelse:\n    p, o, r = 0.50, 0.50, 0.50\n",
+    "TEXTBOX_RO": "if dtype == DataType.TEXT:\n    # Статический вывод (восприятие информации)\n    p, o, r = 0.99, 0.95, 0.95\nelse:\n    p, o, r = 0.50, 0.50, 0.50\n"
+  },
+  "algorithm_limits": {
+    "Многокритериальный (NSGA-II)": {
+      "time_limit_s": 0,
+      "max_iterations": 40
+    },
+    "Классический генетический алгоритм (GA)": {
+      "time_limit_s": 0,
+      "max_iterations": 30
+    },
+    "Полный перебор (Brute Force)": {
+      "time_limit_s": 0
+    },
+    "Локальный поиск (Hill Climb)": {
+      "time_limit_s": 0,
+      "max_iterations": 200
+    },
+    "Алгоритм роя частиц (PSO)": {
+      "time_limit_s": 0,
+      "max_iterations": 50
+    },
+    "Случайный поиск": {
+      "time_limit_s": 0,
+      "max_iterations": 200
+    },
+    "Жадный (Greedy)": {
+      "time_limit_s": 0
+    },
+    "Имитация отжига (SA)": {
+      "time_limit_s": 0,
+      "max_iterations": 300
+    },
+    "Поиск с запретами (Tabu)": {
+      "time_limit_s": 0,
+      "max_iterations": 200
+    },
+    "Муравьиный алгоритм (ACO)": {
+      "time_limit_s": 0,
+      "max_iterations": 40
+    }
+  }
+}

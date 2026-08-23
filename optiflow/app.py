@@ -169,7 +169,7 @@ ALGORITHM_LIMIT_DEFAULTS: Dict[str, Tuple[Optional[str], int]] = {
 }
 
 TASK_SETTINGS_FORMAT = "optiflow-task-settings"
-TASK_SETTINGS_VERSION = 1
+TASK_SETTINGS_VERSION = 2
 
 PROBLEM_DATA_FORMAT = "optiflow-problem-data"
 PROBLEM_DATA_VERSION = 1
@@ -829,10 +829,13 @@ if _HAS_PYQT5:
 
     def export_settings(self) -> Dict[str, Any]:
       self.function_editor.commit_current()
+      from optiflow.models.scoring import KURTA_2024_META_SOURCE
+
       return {
         "format": TASK_SETTINGS_FORMAT,
         "version": TASK_SETTINGS_VERSION,
         "optiflow_version": __version__,
+        "meta_source": KURTA_2024_META_SOURCE,
         "control_functions": self.registry.export_functions(),
         "algorithm_limits": self.limits_table.export_limits(),
       }
