@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from optiflow import __version__
 from optiflow.models.scoring import (
@@ -145,6 +146,9 @@ ALGORITHM_LIMIT_DEFAULTS: Dict[str, Tuple[Optional[str], int]] = {
   "Поиск с запретами (Tabu)": ("iterations", 200),
   "Муравьиный алгоритм (ACO)": ("iterations", 40),
 }
+
+TASK_SETTINGS_FORMAT = "optiflow-task-settings"
+TASK_SETTINGS_VERSION = 1
 
 
 if _HAS_PYQT5:
@@ -453,6 +457,18 @@ if _HAS_PYQT5:
       except Exception as e:
         self.status_label.setText(f"Ошибка: {e}")
 
+    def commit_current(self) -> None:
+      """Persist the open editor buffer into the registry (best-effort)."""
+      ct: ControlType = self.control_combo.currentData()
+      code = self.code_edit.toPlainText()
+      try:
+        self.registry.set_code_for_control(ct, code)
+      except Exception:
+        pass
+
+    def reload_current(self) -> None:
+      self._load_code()
+
 
   class AlgorithmLimitsTable(QtWidgets.QTableWidget):
     def __init__(self, parent=None) -> None:
@@ -510,11 +526,45 @@ if _HAS_PYQT5:
     def all_params(self) -> Dict[str, Dict[str, float]]:
       return {name: self.params_for(name) for name in ALGORITHM_LIMIT_DEFAULTS}
 
+    def export_limits(self) -> Dict[str, Dict[str, int]]:
+      result: Dict[str, Dict[str, int]] = {}
+      for row, name in enumerate(ALGORITHM_LIMIT_DEFAULTS):
+        entry: Dict[str, int] = {"time_limit_s": int(self._time_spins[row].value())}
+        iter_spin = self._iteration_spins[row]
+        if iter_spin is not None:
+          entry["max_iterations"] = int(iter_spin.value())
+        result[name] = entry
+      return result
+
+    def import_limits(self, data: Dict[str, Any]) -> None:
+      for row, name in enumerate(ALGORITHM_LIMIT_DEFAULTS):
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+          continue
+        if "time_limit_s" in entry:
+          self._time_spins[row].setValue(max(0, int(entry["time_limit_s"])))
+        iter_spin = self._iteration_spins[row]
+        if iter_spin is not None and "max_iterations" in entry:
+          iter_spin.setValue(max(1, int(entry["max_iterations"])))
+
 
   class TaskSettingsTab(QtWidgets.QWidget):
     def __init__(self, registry: FunctionRegistry, parent=None) -> None:
       super().__init__(parent)
+      self.registry = registry
       layout = QtWidgets.QVBoxLayout(self)
+
+      io_row = QtWidgets.QHBoxLayout()
+      self.load_btn = QtWidgets.QPushButton("Загрузить…")
+      self.load_btn.clicked.connect(self._load_settings_file)
+      io_row.addWidget(self.load_btn)
+      self.save_btn = QtWidgets.QPushButton("Сохранить…")
+      self.save_btn.clicked.connect(self._save_settings_file)
+      io_row.addWidget(self.save_btn)
+      io_row.addStretch(1)
+      self.io_status_label = QtWidgets.QLabel("")
+      io_row.addWidget(self.io_status_label)
+      layout.addLayout(io_row)
 
       functions_box = QtWidgets.QGroupBox("Функции оценки контролов")
       functions_layout = QtWidgets.QVBoxLayout(functions_box)
@@ -536,6 +586,85 @@ if _HAS_PYQT5:
 
     def limits_for(self, algorithm_name: str) -> Dict[str, float]:
       return self.limits_table.params_for(algorithm_name)
+
+    def export_settings(self) -> Dict[str, Any]:
+      self.function_editor.commit_current()
+      return {
+        "format": TASK_SETTINGS_FORMAT,
+        "version": TASK_SETTINGS_VERSION,
+        "optiflow_version": __version__,
+        "control_functions": self.registry.export_functions(),
+        "algorithm_limits": self.limits_table.export_limits(),
+      }
+
+    def import_settings(self, data: Dict[str, Any]) -> None:
+      if data.get("format") != TASK_SETTINGS_FORMAT:
+        raise ValueError(
+          f"Неизвестный формат файла: {data.get('format')!r}. "
+          f"Ожидается {TASK_SETTINGS_FORMAT!r}."
+        )
+      version = int(data.get("version", 0))
+      if version != TASK_SETTINGS_VERSION:
+        raise ValueError(
+          f"Неподдерживаемая версия настроек: {version}. "
+          f"Ожидается {TASK_SETTINGS_VERSION}."
+        )
+      functions = data.get("control_functions")
+      if not isinstance(functions, dict):
+        raise ValueError("В файле отсутствует объект control_functions.")
+      limits = data.get("algorithm_limits")
+      if not isinstance(limits, dict):
+        raise ValueError("В файле отсутствует объект algorithm_limits.")
+      self.registry.import_functions(functions)
+      self.limits_table.import_limits(limits)
+      self.function_editor.reload_current()
+
+    def _save_settings_file(self) -> None:
+      path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        self,
+        "Сохранить настройки задачи",
+        str(_APP_ROOT / "task_settings.json"),
+        "JSON (*.json)",
+      )
+      if not path:
+        return
+      if not path.lower().endswith(".json"):
+        path += ".json"
+      try:
+        payload = self.export_settings()
+        with open(path, "w", encoding="utf-8") as fh:
+          json.dump(payload, fh, ensure_ascii=False, indent=2)
+          fh.write("\n")
+        self.io_status_label.setText(f"Сохранено: {Path(path).name}")
+      except Exception as exc:
+        QtWidgets.QMessageBox.critical(
+          self,
+          "Ошибка сохранения",
+          f"Не удалось сохранить настройки:\n{exc}",
+        )
+
+    def _load_settings_file(self) -> None:
+      path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        self,
+        "Загрузить настройки задачи",
+        str(_APP_ROOT),
+        "JSON (*.json)",
+      )
+      if not path:
+        return
+      try:
+        with open(path, encoding="utf-8") as fh:
+          data = json.load(fh)
+        if not isinstance(data, dict):
+          raise ValueError("Корень JSON-файла должен быть объектом.")
+        self.import_settings(data)
+        self.io_status_label.setText(f"Загружено: {Path(path).name}")
+      except Exception as exc:
+        QtWidgets.QMessageBox.critical(
+          self,
+          "Ошибка загрузки",
+          f"Не удалось загрузить настройки:\n{exc}",
+        )
 
 
   class AlgorithmsTab(QtWidgets.QWidget):

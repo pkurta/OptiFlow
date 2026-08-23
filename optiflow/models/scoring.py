@@ -209,6 +209,17 @@ class FunctionRegistry:
     def set_code_for_control(self, ctrl: ControlType, code_str: str) -> bool:
         return self.update_code_for_control(ctrl, code_str)
 
+    def export_functions(self) -> Dict[str, str]:
+        return {ctrl.name: self.get_code_for_control(ctrl) for ctrl in ControlType}
+
+    def import_functions(self, data: Dict[str, str]) -> None:
+        for name, code in data.items():
+            try:
+                ctrl = ControlType[name]
+            except KeyError:
+                continue
+            self.update_code_for_control(ctrl, str(code))
+
     def _evaluate_empirical_fallback(self, cls: ControlType, dtype: DataType, size: int) -> EfficiencyTriple:
         if cls == ControlType.CHECKBOX and dtype == DataType.BOOLEAN:
             return EfficiencyTriple(0.95, 0.95, 0.95)
