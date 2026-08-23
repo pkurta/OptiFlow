@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Dict, List, Optional, Tuple
 
 from optiflow.optimization.algorithms import (
@@ -43,6 +44,7 @@ def run_optimization_suite(
   warning: Optional[str] = None
   cancelled = False
   total = len(SUITE_STEPS)
+  suite_started = time.perf_counter()
 
   for index, (key, label) in enumerate(SUITE_STEPS):
     if control is not None and control.cancelled:
@@ -56,6 +58,7 @@ def run_optimization_suite(
         total,
         time_limit_s=float(params.get("time_limit_s", 0)),
       )
+    started = time.perf_counter()
     if key == "NSGA-II":
       results[key] = nsga2(
         space,
@@ -131,11 +134,19 @@ def run_optimization_suite(
         deposit_weight=float(params.get("deposit_weight", 1.0)),
         control=control,
       )
+    else:
+      raise RuntimeError(f"Unknown suite algorithm key: {key}")
+    results[key]["elapsed_s"] = time.perf_counter() - started
     if control is not None and control.cancelled:
       cancelled = True
       break
 
-  return {"results": results, "cancelled": cancelled, "warning": warning}
+  return {
+    "results": results,
+    "cancelled": cancelled,
+    "warning": warning,
+    "total_elapsed_s": time.perf_counter() - suite_started,
+  }
 
 
 def histories_from_results(
