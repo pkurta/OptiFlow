@@ -48,9 +48,14 @@ def run_optimization_suite(
     if control is not None and control.cancelled:
       cancelled = True
       break
-    if control is not None:
-      control.begin_algorithm(label, index, total)
     params = params_by_label.get(label, {})
+    if control is not None:
+      control.begin_algorithm(
+        label,
+        index,
+        total,
+        time_limit_s=float(params.get("time_limit_s", 0)),
+      )
     if key == "NSGA-II":
       results[key] = nsga2(
         space,

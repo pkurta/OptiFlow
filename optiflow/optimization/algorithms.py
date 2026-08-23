@@ -229,6 +229,7 @@ class OptimizationControl:
     self.algorithm = ""
     self.algorithm_index = 0
     self.algorithm_count = 1
+    self._deadline: Optional[float] = None
 
   def cancel(self) -> None:
     self._cancel.set()
@@ -237,11 +238,29 @@ class OptimizationControl:
   def cancelled(self) -> bool:
     return self._cancel.is_set()
 
-  def begin_algorithm(self, name: str, index: int, count: int) -> None:
+  def begin_algorithm(
+    self,
+    name: str,
+    index: int,
+    count: int,
+    *,
+    time_limit_s: float = 0.0,
+  ) -> None:
     self.algorithm = name
     self.algorithm_index = index
     self.algorithm_count = max(1, count)
+    if time_limit_s > 0:
+      self._deadline = time.monotonic() + time_limit_s
+    else:
+      self._deadline = None
     self.notify(0, 1, 0.0, force=True)
+
+  def should_stop(self) -> bool:
+    if self._cancel.is_set():
+      return True
+    if self._deadline is not None and time.monotonic() >= self._deadline:
+      return True
+    return False
 
   def notify(
     self,
@@ -255,7 +274,7 @@ class OptimizationControl:
     force: bool = False,
   ) -> bool:
     """Push telemetry. Returns True when the run should stop."""
-    if self._cancel.is_set():
+    if self.should_stop():
       return True
     now = time.monotonic()
     if not force and (now - self._last_emit) < self._min_interval_s:
@@ -286,7 +305,7 @@ class OptimizationControl:
         )
       )
       time.sleep(0.001)
-    return self._cancel.is_set()
+    return self.should_stop()
 
 
 def emit_progress(

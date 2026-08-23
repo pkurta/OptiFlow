@@ -131,6 +131,21 @@ _DIM_WEIGHT_LABELS = (
   "Вес ресурсоэкономности",
 )
 
+# Итерационный параметр и дефолт для вкладки «Настройка задачи».
+# None — алгоритм без настраиваемого лимита итераций.
+ALGORITHM_LIMIT_DEFAULTS: Dict[str, Tuple[Optional[str], int]] = {
+  "Многокритериальный (NSGA-II)": ("generations", 40),
+  "Классический генетический алгоритм (GA)": ("generations", 30),
+  "Полный перебор (Brute Force)": (None, 0),
+  "Локальный поиск (Hill Climb)": ("iterations", 200),
+  "Алгоритм роя частиц (PSO)": ("iterations", 50),
+  "Случайный поиск": ("iterations", 200),
+  "Жадный (Greedy)": (None, 0),
+  "Имитация отжига (SA)": ("iterations", 300),
+  "Поиск с запретами (Tabu)": ("iterations", 200),
+  "Муравьиный алгоритм (ACO)": ("iterations", 40),
+}
+
 
 if _HAS_PYQT5:
 
@@ -439,48 +454,122 @@ if _HAS_PYQT5:
         self.status_label.setText(f"Ошибка: {e}")
 
 
+  class AlgorithmLimitsTable(QtWidgets.QTableWidget):
+    def __init__(self, parent=None) -> None:
+      super().__init__(0, 3, parent)
+      self.setHorizontalHeaderLabels(["Алгоритм", "Макс. итераций", "Время, сек"])
+      self.horizontalHeader().setStretchLastSection(True)
+      self.verticalHeader().setVisible(False)
+      self.setAlternatingRowColors(True)
+      self._iteration_spins: List[Optional[QtWidgets.QSpinBox]] = []
+      self._time_spins: List[QtWidgets.QSpinBox] = []
+      for name in ALGORITHM_LIMIT_DEFAULTS:
+        self._add_row(name)
+
+    def _add_row(self, algorithm_name: str) -> None:
+      row = self.rowCount()
+      self.insertRow(row)
+      name_item = QtWidgets.QTableWidgetItem(algorithm_name)
+      name_item.setFlags(name_item.flags() & ~QtCore.Qt.ItemIsEditable)
+      self.setItem(row, 0, name_item)
+
+      iter_key, default_iter = ALGORITHM_LIMIT_DEFAULTS[algorithm_name]
+      iter_spin: Optional[QtWidgets.QSpinBox]
+      if iter_key is None:
+        iter_spin = None
+        placeholder = QtWidgets.QTableWidgetItem("—")
+        placeholder.setFlags(placeholder.flags() & ~QtCore.Qt.ItemIsEditable)
+        placeholder.setTextAlignment(QtCore.Qt.AlignCenter)
+        self.setItem(row, 1, placeholder)
+      else:
+        iter_spin = QtWidgets.QSpinBox()
+        iter_spin.setRange(1, 1_000_000)
+        iter_spin.setValue(default_iter)
+        self.setCellWidget(row, 1, iter_spin)
+      self._iteration_spins.append(iter_spin)
+
+      time_spin = QtWidgets.QSpinBox()
+      time_spin.setRange(0, 86_400)
+      time_spin.setSpecialValueText("без лимита")
+      time_spin.setValue(0)
+      self.setCellWidget(row, 2, time_spin)
+      self._time_spins.append(time_spin)
+
+    def params_for(self, algorithm_name: str) -> Dict[str, float]:
+      for row, name in enumerate(ALGORITHM_LIMIT_DEFAULTS):
+        if name != algorithm_name:
+          continue
+        result: Dict[str, float] = {"time_limit_s": float(self._time_spins[row].value())}
+        iter_key, _ = ALGORITHM_LIMIT_DEFAULTS[name]
+        iter_spin = self._iteration_spins[row]
+        if iter_key is not None and iter_spin is not None:
+          result[iter_key] = float(iter_spin.value())
+        return result
+      return {"time_limit_s": 0.0}
+
+    def all_params(self) -> Dict[str, Dict[str, float]]:
+      return {name: self.params_for(name) for name in ALGORITHM_LIMIT_DEFAULTS}
+
+
+  class TaskSettingsTab(QtWidgets.QWidget):
+    def __init__(self, registry: FunctionRegistry, parent=None) -> None:
+      super().__init__(parent)
+      layout = QtWidgets.QVBoxLayout(self)
+
+      functions_box = QtWidgets.QGroupBox("Функции оценки контролов")
+      functions_layout = QtWidgets.QVBoxLayout(functions_box)
+      self.function_editor = FunctionEditor(registry)
+      functions_layout.addWidget(self.function_editor)
+      layout.addWidget(functions_box, stretch=3)
+
+      limits_box = QtWidgets.QGroupBox("Лимиты выполнения алгоритмов")
+      limits_layout = QtWidgets.QVBoxLayout(limits_box)
+      self.limits_table = AlgorithmLimitsTable()
+      limits_layout.addWidget(self.limits_table)
+      hint = QtWidgets.QLabel(
+        "Макс. итераций задаёт верхнюю границу шагов алгоритма. "
+        "Время — лимит в секундах на один алгоритм (0 = без ограничения)."
+      )
+      hint.setWordWrap(True)
+      limits_layout.addWidget(hint)
+      layout.addWidget(limits_box, stretch=2)
+
+    def limits_for(self, algorithm_name: str) -> Dict[str, float]:
+      return self.limits_table.params_for(algorithm_name)
+
+
   class AlgorithmsTab(QtWidgets.QWidget):
     runRequested = QtCore.pyqtSignal()
 
     PARAM_SCHEMAS: Dict[str, List[Dict[str, object]]] = {
       "Многокритериальный (NSGA-II)": [
       {"key": "pop_size", "label": "Размер популяции", "type": "int", "min": 10, "max": 2000, "default": 40, "step": 10},
-      {"key": "generations", "label": "Поколения", "type": "int", "min": 1, "max": 2000, "default": 40, "step": 5},
       {"key": "crossover_prob", "label": "Вероятность кроссовера", "type": "float", "min": 0.0, "max": 1.0, "default": 0.9, "step": 0.05, "decimals": 3},
       {"key": "mutation_prob", "label": "Вероятность мутации", "type": "float", "min": 0.0, "max": 1.0, "default": 0.2, "step": 0.05, "decimals": 3},
       {"key": "mutation_sigma", "label": "Сигма мутации", "type": "float", "min": 0.01, "max": 5.0, "default": 0.5, "step": 0.05, "decimals": 3},
     ],
-      "Локальный поиск (Hill Climb)": [
-      {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 5000, "default": 200, "step": 10},
-    ],
+      "Локальный поиск (Hill Climb)": [],
       "Алгоритм роя частиц (PSO)": [
       {"key": "swarm_size", "label": "Размер роя", "type": "int", "min": 5, "max": 2000, "default": 30, "step": 5},
-      {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 5000, "default": 50, "step": 5},
       {"key": "inertia", "label": "Инерция", "type": "float", "min": 0.0, "max": 2.0, "default": 0.7, "step": 0.05, "decimals": 3},
       {"key": "cognitive", "label": "Cognitive", "type": "float", "min": 0.0, "max": 5.0, "default": 1.5, "step": 0.1, "decimals": 3},
       {"key": "social", "label": "Social", "type": "float", "min": 0.0, "max": 5.0, "default": 1.5, "step": 0.1, "decimals": 3},
     ],
-      "Случайный поиск": [
-      {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 200, "step": 50},
-    ],
+      "Случайный поиск": [],
       "Жадный (Greedy)": [],
       "Полный перебор (Brute Force)": [],
       "Классический генетический алгоритм (GA)": [
       {"key": "pop_size", "label": "Размер популяции", "type": "int", "min": 10, "max": 1000, "default": 30, "step": 10},
-      {"key": "generations", "label": "Поколения", "type": "int", "min": 1, "max": 1000, "default": 30, "step": 5},
     ],
       "Имитация отжига (SA)": [
-      {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 300, "step": 50},
       {"key": "initial_temp", "label": "Начальная температура", "type": "float", "min": 0.1, "max": 100.0, "default": 5.0, "step": 0.5, "decimals": 3},
       {"key": "cooling", "label": "Коэффициент охлаждения", "type": "float", "min": 0.80, "max": 0.999, "default": 0.97, "step": 0.001, "decimals": 4},
     ],
       "Поиск с запретами (Tabu)": [
-      {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 10000, "default": 200, "step": 20},
       {"key": "tabu_tenure", "label": "Длина табу-списка", "type": "int", "min": 1, "max": 200, "default": 7, "step": 1},
     ],
       "Муравьиный алгоритм (ACO)": [
       {"key": "ants", "label": "Количество муравьёв", "type": "int", "min": 1, "max": 500, "default": 20, "step": 5},
-      {"key": "iterations", "label": "Итерации", "type": "int", "min": 1, "max": 2000, "default": 40, "step": 5},
       {"key": "alpha", "label": "Вес феромона (alpha)", "type": "float", "min": 0.0, "max": 5.0, "default": 1.0, "step": 0.1, "decimals": 3},
       {"key": "beta", "label": "Вес эвристики (beta)", "type": "float", "min": 0.0, "max": 5.0, "default": 2.0, "step": 0.1, "decimals": 3},
       {"key": "evaporation", "label": "Испарение", "type": "float", "min": 0.0, "max": 1.0, "default": 0.1, "step": 0.01, "decimals": 3},
@@ -507,7 +596,7 @@ if _HAS_PYQT5:
       layout.addRow("Алгоритм:", self.algorithm_combo)
 
       self.param_controls: List[Tuple[QtWidgets.QLabel, QtWidgets.QDoubleSpinBox]] = []
-      max_params = max(len(v) for v in self.PARAM_SCHEMAS.values())
+      max_params = max((len(v) for v in self.PARAM_SCHEMAS.values()), default=0)
       for _ in range(max_params):
         lbl = QtWidgets.QLabel("")
         spin = QtWidgets.QDoubleSpinBox()
@@ -835,14 +924,14 @@ if _HAS_PYQT5:
       weights_layout.addWidget(hint)
       data_layout.addWidget(weights_box)
 
-      self.task_tab = FunctionEditor(self.registry)
+      self.task_tab = TaskSettingsTab(self.registry)
       self.alg_tab = AlgorithmsTab()
       self.alg_tab.runRequested.connect(self.run_algorithms)
       self.charts_tab = ChartsTab()
 
       tabs.addTab(self.data_tab, "Данные, тип, длина")
-      tabs.addTab(self.task_tab, "Настройка задачи")
       tabs.addTab(self.alg_tab, "Алгоритмы")
+      tabs.addTab(self.task_tab, "Настройка задачи")
       tabs.addTab(self.charts_tab, "Графики")
 
       file_menu = self.menuBar().addMenu("Файл")
@@ -896,7 +985,11 @@ if _HAS_PYQT5:
       if self._worker is not None and self._worker.isRunning():
         return
       space, evaluator = self._build_space()
-      params_by_label = {label: self.alg_tab.params_for(label) for _, label in SUITE_STEPS}
+      params_by_label: Dict[str, Dict[str, float]] = {}
+      for _, label in SUITE_STEPS:
+        params = self.alg_tab.params_for(label)
+        params.update(self.task_tab.limits_for(label))
+        params_by_label[label] = params
       self._worker = OptimizationWorker(space, evaluator, params_by_label, parent=self)
       self._run_control = OptimizationControl(on_progress=self._worker.progress.emit)
       self._worker.control = self._run_control
