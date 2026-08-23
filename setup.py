@@ -7,6 +7,8 @@ setup(
     packages=find_packages(),
     install_requires=[
         "PyQt5==5.15.10",
+        "PyQtWebEngine==5.15.6",
+        "certifi>=2024.2.2",
         "numpy==1.26.4",
         "matplotlib==3.8.4",
         "scipy==1.11.4",
