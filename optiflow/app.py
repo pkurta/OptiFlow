@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -46,6 +47,19 @@ from optiflow.optimization.runner import (
   run_optimization_suite,
 )
 from optiflow.benchmarks import run_optimization_benchmark
+from optiflow.ui.gemini_interpretation import (
+  DEFAULT_GEMINI_MODEL,
+  GEMINI_MODEL_CHOICES,
+  build_interpretation_prompt,
+  gemini_model_label,
+  request_gemini_flash,
+)
+from optiflow.ui.run_results import (
+  AlgorithmRunSummary,
+  build_algorithm_summaries,
+  format_optimization_report,
+  summaries_with_layouts,
+)
 from optiflow.ui.web_generator import generate_html_from_layout
 
 _APP_ROOT = Path(__file__).resolve().parent.parent
@@ -101,6 +115,13 @@ try:
 except ImportError:
   _HAS_PYQT5 = False
 
+try:
+  from PyQt5.QtWebEngineWidgets import QWebEngineView
+
+  _HAS_WEBENGINE = True
+except ImportError:
+  _HAS_WEBENGINE = False
+
 
 def _allowed_controls_for_field(field: FieldSpec) -> List[ControlType]:
   """
@@ -149,6 +170,9 @@ ALGORITHM_LIMIT_DEFAULTS: Dict[str, Tuple[Optional[str], int]] = {
 
 TASK_SETTINGS_FORMAT = "optiflow-task-settings"
 TASK_SETTINGS_VERSION = 1
+
+PROBLEM_DATA_FORMAT = "optiflow-problem-data"
+PROBLEM_DATA_VERSION = 1
 
 
 if _HAS_PYQT5:
@@ -342,6 +366,22 @@ if _HAS_PYQT5:
         self._refresh_label(index)
       self.sum_label.setText("Сумма весов: 1.00")
 
+    def current_preset(self) -> str:
+      return self.preset_combo.currentText()
+
+    def apply_preset_or_weights(self, preset: str, weights: CriterionWeights) -> None:
+      if preset in WEIGHT_PRESETS:
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentText(preset)
+        self.preset_combo.blockSignals(False)
+        self.set_weights(CriterionWeights.from_raw(*WEIGHT_PRESETS[preset]), mark_custom=False)
+      else:
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentText(CUSTOM_WEIGHT_PRESET)
+        self.preset_combo.blockSignals(False)
+        self.set_weights(weights, mark_custom=False)
+      self.changed.emit(self.weights())
+
 
   class FieldTable(QtWidgets.QTableWidget):
     def __init__(self, parent=None) -> None:
@@ -417,6 +457,206 @@ if _HAS_PYQT5:
         size = 1 if dtype == DataType.BOOLEAN else size_widget.value()
         result.append(FieldSpec(name=name, data_type=dtype, size=size))
       return result
+
+    def export_fields(self) -> List[Dict[str, Any]]:
+      return [
+        {
+          "name": field.name,
+          "data_type": field.data_type.name,
+          "size": field.size,
+        }
+        for field in self.fields()
+      ]
+
+    def load_fields(self, items: List[Dict[str, Any]]) -> None:
+      self.setRowCount(0)
+      for item in items:
+        if not isinstance(item, dict):
+          continue
+        name = str(item.get("name", "")).strip() or self.next_default_field_name()
+        try:
+          dtype = DataType[str(item.get("data_type", "TEXT"))]
+        except KeyError:
+          dtype = DataType.TEXT
+        size = max(1, int(item.get("size", 1)))
+        if dtype == DataType.BOOLEAN:
+          size = 1
+        self.add_field(name, dtype, size)
+
+
+  class DataTaskTab(QtWidgets.QWidget):
+    maxFormsChanged = QtCore.pyqtSignal(int)
+    weightsChanged = QtCore.pyqtSignal(object)
+
+    def __init__(self, parent=None) -> None:
+      super().__init__(parent)
+      layout = QtWidgets.QVBoxLayout(self)
+
+      io_row = QtWidgets.QHBoxLayout()
+      self.load_btn = QtWidgets.QPushButton("Загрузить…")
+      self.load_btn.clicked.connect(self._load_problem_file)
+      io_row.addWidget(self.load_btn)
+      self.save_btn = QtWidgets.QPushButton("Сохранить…")
+      self.save_btn.clicked.connect(self._save_problem_file)
+      io_row.addWidget(self.save_btn)
+      io_row.addStretch(1)
+      self.io_status_label = QtWidgets.QLabel("")
+      io_row.addWidget(self.io_status_label)
+      layout.addLayout(io_row)
+
+      self.field_table = FieldTable()
+      layout.addWidget(self.field_table)
+
+      field_btns = QtWidgets.QHBoxLayout()
+      add_btn = QtWidgets.QPushButton("Добавить поле")
+      add_btn.clicked.connect(self._add_field)
+      field_btns.addWidget(add_btn)
+      remove_btn = QtWidgets.QPushButton("Удалить выбранное")
+      remove_btn.clicked.connect(self._remove_selected_field)
+      field_btns.addWidget(remove_btn)
+      layout.addLayout(field_btns)
+
+      form_row = QtWidgets.QHBoxLayout()
+      form_row.addWidget(QtWidgets.QLabel("Макс. число экранов мастера (N):"))
+      self.max_forms_spin = QtWidgets.QSpinBox()
+      self.max_forms_spin.setRange(1, 12)
+      self.max_forms_spin.setValue(3)
+      self.max_forms_spin.valueChanged.connect(self.maxFormsChanged.emit)
+      form_row.addWidget(self.max_forms_spin)
+      layout.addLayout(form_row)
+
+      form_hint = QtWidgets.QLabel(
+        "N задаёт, на сколько экранов алгоритм может распределить контролы."
+      )
+      form_hint.setWordWrap(True)
+      layout.addWidget(form_hint)
+
+      weights_box = QtWidgets.QGroupBox("Приоритеты оптимизации")
+      weights_layout = QtWidgets.QVBoxLayout(weights_box)
+      self.coef = WeightSliders()
+      self.coef.changed.connect(self.weightsChanged.emit)
+      weights_layout.addWidget(self.coef)
+      hint = QtWidgets.QLabel(
+        "P, O и R — расчётные свойства готового интерфейса, не вход. "
+        "Здесь задаются только веса свёртки F = w₁P + w₂O + w₃R, сумма всегда равна 1."
+      )
+      hint.setWordWrap(True)
+      weights_layout.addWidget(hint)
+      layout.addWidget(weights_box)
+
+      self.field_table.add_field("Возраст", DataType.UNSIGNED, 3)
+      self.field_table.add_field("Имя", DataType.TEXT, 16)
+      self.field_table.add_field("Согласие", DataType.BOOLEAN, 1)
+
+    @property
+    def max_forms(self) -> int:
+      return int(self.max_forms_spin.value())
+
+    def _add_field(self) -> None:
+      self.field_table.add_field(self.field_table.next_default_field_name(), DataType.TEXT, 16)
+
+    def _remove_selected_field(self) -> None:
+      rows = sorted({i.row() for i in self.field_table.selectedIndexes()}, reverse=True)
+      for row in rows:
+        self.field_table.removeRow(row)
+
+    def export_problem(self) -> Dict[str, Any]:
+      self.coef.commit()
+      weights = self.coef.weights()
+      w1, w2, w3 = weights.as_tuple()
+      return {
+        "format": PROBLEM_DATA_FORMAT,
+        "version": PROBLEM_DATA_VERSION,
+        "optiflow_version": __version__,
+        "max_forms": self.max_forms,
+        "weight_preset": self.coef.current_preset(),
+        "weights": {
+          "potency": w1,
+          "operativeness": w2,
+          "resource_saving": w3,
+        },
+        "fields": self.field_table.export_fields(),
+      }
+
+    def import_problem(self, data: Dict[str, Any]) -> None:
+      if data.get("format") != PROBLEM_DATA_FORMAT:
+        raise ValueError(
+          f"Неизвестный формат файла: {data.get('format')!r}. "
+          f"Ожидается {PROBLEM_DATA_FORMAT!r}."
+        )
+      version = int(data.get("version", 0))
+      if version != PROBLEM_DATA_VERSION:
+        raise ValueError(
+          f"Неподдерживаемая версия данных: {version}. "
+          f"Ожидается {PROBLEM_DATA_VERSION}."
+        )
+      fields = data.get("fields")
+      if not isinstance(fields, list):
+        raise ValueError("В файле отсутствует массив fields.")
+      if not fields:
+        raise ValueError("Список полей не может быть пустым.")
+      weights_raw = data.get("weights")
+      if not isinstance(weights_raw, dict):
+        raise ValueError("В файле отсутствует объект weights.")
+      weights = CriterionWeights.from_raw(
+        float(weights_raw.get("potency", 0.0)),
+        float(weights_raw.get("operativeness", 0.0)),
+        float(weights_raw.get("resource_saving", 0.0)),
+      )
+      max_forms = max(1, min(12, int(data.get("max_forms", 1))))
+      preset = str(data.get("weight_preset", CUSTOM_WEIGHT_PRESET))
+      self.max_forms_spin.setValue(max_forms)
+      self.coef.apply_preset_or_weights(preset, weights)
+      self.field_table.load_fields(fields)
+      self.maxFormsChanged.emit(max_forms)
+      self.weightsChanged.emit(self.coef.weights())
+
+    def _save_problem_file(self) -> None:
+      path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        self,
+        "Сохранить постановку задачи",
+        str(_APP_ROOT / "problem_data.json"),
+        "JSON (*.json)",
+      )
+      if not path:
+        return
+      if not path.lower().endswith(".json"):
+        path += ".json"
+      try:
+        payload = self.export_problem()
+        with open(path, "w", encoding="utf-8") as fh:
+          json.dump(payload, fh, ensure_ascii=False, indent=2)
+          fh.write("\n")
+        self.io_status_label.setText(f"Сохранено: {Path(path).name}")
+      except Exception as exc:
+        QtWidgets.QMessageBox.critical(
+          self,
+          "Ошибка сохранения",
+          f"Не удалось сохранить постановку задачи:\n{exc}",
+        )
+
+    def _load_problem_file(self) -> None:
+      path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        self,
+        "Загрузить постановку задачи",
+        str(_APP_ROOT),
+        "JSON (*.json)",
+      )
+      if not path:
+        return
+      try:
+        with open(path, encoding="utf-8") as fh:
+          data = json.load(fh)
+        if not isinstance(data, dict):
+          raise ValueError("Корень JSON-файла должен быть объектом.")
+        self.import_problem(data)
+        self.io_status_label.setText(f"Загружено: {Path(path).name}")
+      except Exception as exc:
+        QtWidgets.QMessageBox.critical(
+          self,
+          "Ошибка загрузки",
+          f"Не удалось загрузить постановку задачи:\n{exc}",
+        )
 
 
   class FunctionEditor(QtWidgets.QWidget):
@@ -1000,6 +1240,274 @@ if _HAS_PYQT5:
       self.results_label.setText("\n".join(lines))
 
 
+  class VisualizationTab(QtWidgets.QWidget):
+    def __init__(self, parent=None) -> None:
+      super().__init__(parent)
+      self._summaries: List[AlgorithmRunSummary] = []
+      self._preview_dir = Path(tempfile.gettempdir()) / "optiflow_previews"
+      self._preview_dir.mkdir(parents=True, exist_ok=True)
+
+      layout = QtWidgets.QVBoxLayout(self)
+      top = QtWidgets.QHBoxLayout()
+      top.addWidget(QtWidgets.QLabel("Алгоритм:"))
+      self.algorithm_combo = QtWidgets.QComboBox()
+      self.algorithm_combo.setMinimumWidth(360)
+      self.algorithm_combo.currentIndexChanged.connect(self._show_selected)
+      top.addWidget(self.algorithm_combo, stretch=1)
+      layout.addLayout(top)
+
+      self.metrics_label = QtWidgets.QLabel(
+        "Запустите оптимизацию, чтобы просмотреть сгенерированные интерфейсы."
+      )
+      self.metrics_label.setWordWrap(True)
+      layout.addWidget(self.metrics_label)
+
+      if _HAS_WEBENGINE:
+        self.web_view: Optional[QtWidgets.QWidget] = QWebEngineView()
+        layout.addWidget(self.web_view, stretch=1)
+      else:
+        self.web_view = None
+        fallback = QtWidgets.QLabel(
+          "Для интерактивного просмотра установите PyQtWebEngine "
+          "(pip install PyQtWebEngine). Ниже — упрощённый предпросмотр первого шага."
+        )
+        fallback.setWordWrap(True)
+        layout.addWidget(fallback)
+        self.fallback_browser = QtWidgets.QTextBrowser()
+        self.fallback_browser.setOpenExternalLinks(True)
+        layout.addWidget(self.fallback_browser, stretch=1)
+
+    def show_results(self, summaries: List[AlgorithmRunSummary]) -> None:
+      self._summaries = sorted(
+        summaries_with_layouts(summaries),
+        key=lambda item: item.fitness,
+        reverse=True,
+      )
+      self.algorithm_combo.blockSignals(True)
+      self.algorithm_combo.clear()
+      for item in self._summaries:
+        self.algorithm_combo.addItem(
+          f"{item.label} — F={item.fitness:.4f}",
+          item.key,
+        )
+      self.algorithm_combo.blockSignals(False)
+      if self._summaries:
+        self.algorithm_combo.setCurrentIndex(0)
+        self._show_selected()
+      else:
+        self.metrics_label.setText("Нет алгоритмов с готовым layout для визуализации.")
+        if self.web_view is not None and _HAS_WEBENGINE:
+          self.web_view.setHtml("<p>Нет данных для отображения.</p>")  # type: ignore[union-attr]
+        elif hasattr(self, "fallback_browser"):
+          self.fallback_browser.setHtml("<p>Нет данных для отображения.</p>")
+
+    def _show_selected(self) -> None:
+      if not self._summaries or self.algorithm_combo.count() == 0:
+        return
+      key = self.algorithm_combo.currentData()
+      item = next((s for s in self._summaries if s.key == key), None)
+      if item is None or item.layout is None or item.triple is None:
+        return
+      self.metrics_label.setText(
+        f"P={item.triple.potency:.3f}  O={item.triple.operativeness:.3f}  "
+        f"R={item.triple.resource_saving:.3f}  F={item.fitness:.4f}  "
+        f"экранов={item.form_count}  шагов истории={item.history_steps}\n"
+        f"Контролы: {', '.join(c.name for c in item.layout.controls_flat())}"
+      )
+      html = generate_html_from_layout(item.layout)
+      preview_path = self._preview_dir / f"{item.key}.html"
+      preview_path.write_text(html, encoding="utf-8")
+      if self.web_view is not None and _HAS_WEBENGINE:
+        self.web_view.load(QtCore.QUrl.fromLocalFile(str(preview_path.resolve())))  # type: ignore[union-attr]
+      elif hasattr(self, "fallback_browser"):
+        self.fallback_browser.setHtml(html)
+
+
+  class ReportTab(QtWidgets.QWidget):
+    def __init__(self, parent=None) -> None:
+      super().__init__(parent)
+      layout = QtWidgets.QVBoxLayout(self)
+      self.report_edit = QtWidgets.QPlainTextEdit()
+      self.report_edit.setReadOnly(True)
+      self.report_edit.setPlaceholderText(
+        "Запустите оптимизацию — здесь появится текстовый отчёт по всем алгоритмам."
+      )
+      self.report_edit.setFont(QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont))
+      layout.addWidget(self.report_edit)
+
+    def show_report(self, text: str) -> None:
+      self.report_edit.setPlainText(text)
+
+
+  class GeminiInterpretWorker(QtCore.QThread):
+    completed = QtCore.pyqtSignal(str)
+    failed = QtCore.pyqtSignal(str)
+
+    def __init__(
+      self,
+      api_key: str,
+      prompt: str,
+      model: str,
+      parent=None,
+    ) -> None:
+      super().__init__(parent)
+      self._api_key = api_key
+      self._prompt = prompt
+      self._model = model
+
+    def run(self) -> None:
+      try:
+        text = request_gemini_flash(self._api_key, self._prompt, model=self._model)
+        self.completed.emit(text)
+      except Exception as exc:
+        self.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+  class InterpretationTab(QtWidgets.QWidget):
+    _SETTINGS_KEY = "gemini_api_key"
+    _MODEL_SETTINGS_KEY = "gemini_model_id"
+
+    def __init__(self, parent=None) -> None:
+      super().__init__(parent)
+      self._settings = QtCore.QSettings("OptiFlow", "OptiFlow")
+      self._summaries: List[AlgorithmRunSummary] = []
+      self._report_text = ""
+      self._fields: List[FieldSpec] = []
+      self._max_forms = 1
+      self._weights = CriterionWeights.balanced()
+      self._cancelled = False
+      self._warning: Optional[str] = None
+      self._worker: Optional[GeminiInterpretWorker] = None
+
+      layout = QtWidgets.QVBoxLayout(self)
+
+      key_row = QtWidgets.QHBoxLayout()
+      key_row.addWidget(QtWidgets.QLabel("API-ключ Gemini Flash:"))
+      self.api_key_edit = QtWidgets.QLineEdit()
+      self.api_key_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+      self.api_key_edit.setPlaceholderText("AIza…")
+      saved_key = self._settings.value(self._SETTINGS_KEY, "", type=str)
+      if saved_key:
+        self.api_key_edit.setText(saved_key)
+      key_row.addWidget(self.api_key_edit, stretch=1)
+      layout.addLayout(key_row)
+
+      model_row = QtWidgets.QHBoxLayout()
+      model_row.addWidget(QtWidgets.QLabel("Модель Gemini Flash:"))
+      self.model_combo = QtWidgets.QComboBox()
+      saved_model = self._settings.value(
+        self._MODEL_SETTINGS_KEY, DEFAULT_GEMINI_MODEL, type=str
+      )
+      saved_index = 0
+      for index, (label, model_id) in enumerate(GEMINI_MODEL_CHOICES):
+        self.model_combo.addItem(label, model_id)
+        if model_id == saved_model:
+          saved_index = index
+      self.model_combo.setCurrentIndex(saved_index)
+      self.model_combo.setMinimumWidth(280)
+      model_row.addWidget(self.model_combo, stretch=1)
+      layout.addLayout(model_row)
+
+      actions = QtWidgets.QHBoxLayout()
+      self.send_btn = QtWidgets.QPushButton("Отправить")
+      self.send_btn.clicked.connect(self._send_interpretation)
+      actions.addWidget(self.send_btn)
+      self.status_label = QtWidgets.QLabel("")
+      actions.addWidget(self.status_label, stretch=1)
+      layout.addLayout(actions)
+
+      hint = QtWidgets.QLabel(
+        "Сначала запустите оптимизацию. По кнопке «Отправить» формируется промпт "
+        "из постановки задачи, отчёта и layout всех алгоритмов, затем запрос уходит в Gemini Flash. "
+        "Ключ хранится локально в настройках приложения."
+      )
+      hint.setWordWrap(True)
+      layout.addWidget(hint)
+
+      self.result_edit = QtWidgets.QPlainTextEdit()
+      self.result_edit.setReadOnly(True)
+      self.result_edit.setPlaceholderText(
+        "Здесь появится интерпретация результатов от Gemini Flash."
+      )
+      layout.addWidget(self.result_edit, stretch=1)
+
+    def set_run_context(
+      self,
+      *,
+      summaries: List[AlgorithmRunSummary],
+      report_text: str,
+      fields: List[FieldSpec],
+      max_forms: int,
+      weights: CriterionWeights,
+      cancelled: bool,
+      warning: Optional[str],
+    ) -> None:
+      self._summaries = summaries
+      self._report_text = report_text
+      self._fields = fields
+      self._max_forms = max_forms
+      self._weights = weights
+      self._cancelled = cancelled
+      self._warning = warning
+      self.status_label.setText("Данные прогона обновлены.")
+
+    def _send_interpretation(self) -> None:
+      if self._worker is not None and self._worker.isRunning():
+        return
+      if not self._summaries:
+        QtWidgets.QMessageBox.warning(
+          self,
+          "Интерпретация",
+          "Нет данных прогона. Сначала нажмите «Запустить» на вкладке «Алгоритмы».",
+        )
+        return
+      api_key = self.api_key_edit.text().strip()
+      if not api_key:
+        QtWidgets.QMessageBox.warning(self, "Интерпретация", "Введите API-ключ Gemini Flash.")
+        return
+
+      prompt = build_interpretation_prompt(
+        summaries=self._summaries,
+        report_text=self._report_text,
+        fields=self._fields,
+        max_forms=self._max_forms,
+        weights=self._weights,
+        cancelled=self._cancelled,
+        warning=self._warning,
+        optiflow_version=__version__,
+      )
+
+      self.send_btn.setEnabled(False)
+      model_id = str(self.model_combo.currentData() or DEFAULT_GEMINI_MODEL)
+      self.status_label.setText(
+        f"Запрос к {gemini_model_label(model_id)}…"
+      )
+      self.result_edit.setPlainText(f"Ожидание ответа ({gemini_model_label(model_id)})…\n")
+
+      self._worker = GeminiInterpretWorker(api_key, prompt, model_id, parent=self)
+      self._worker.completed.connect(self._on_completed)
+      self._worker.failed.connect(self._on_failed)
+      self._worker.finished.connect(self._clear_worker)
+      self._worker.start()
+
+    def _on_completed(self, text: str) -> None:
+      self._settings.setValue(self._SETTINGS_KEY, self.api_key_edit.text().strip())
+      model_id = str(self.model_combo.currentData() or DEFAULT_GEMINI_MODEL)
+      self._settings.setValue(self._MODEL_SETTINGS_KEY, model_id)
+      self.result_edit.setPlainText(text)
+      self.status_label.setText("Интерпретация получена.")
+      self.send_btn.setEnabled(True)
+
+    def _on_failed(self, message: str) -> None:
+      self.result_edit.setPlainText(f"Ошибка:\n{message}")
+      self.status_label.setText("Ошибка запроса.")
+      self.send_btn.setEnabled(True)
+      QtWidgets.QMessageBox.critical(self, "Gemini Flash", message)
+
+    def _clear_worker(self) -> None:
+      self._worker = None
+
+
   class MainWindow(QtWidgets.QMainWindow):
     def __init__(self) -> None:
       super().__init__()
@@ -1012,80 +1520,43 @@ if _HAS_PYQT5:
       tabs = QtWidgets.QTabWidget()
       self.setCentralWidget(tabs)
 
-      self.data_tab = QtWidgets.QWidget()
-      data_layout = QtWidgets.QVBoxLayout(self.data_tab)
-      self.field_table = FieldTable()
-      data_layout.addWidget(self.field_table)
-      btns = QtWidgets.QHBoxLayout()
-      data_layout.addLayout(btns)
-      add_btn = QtWidgets.QPushButton("Добавить поле")
-      add_btn.clicked.connect(self._add_field)
-      btns.addWidget(add_btn)
-      remove_btn = QtWidgets.QPushButton("Удалить выбранное")
-      remove_btn.clicked.connect(self._remove_selected_field)
-      btns.addWidget(remove_btn)
-
-      form_row = QtWidgets.QHBoxLayout()
-      data_layout.addLayout(form_row)
-      form_row.addWidget(QtWidgets.QLabel("Макс. число экранов мастера (N):"))
-      self.max_forms_spin = QtWidgets.QSpinBox()
-      self.max_forms_spin.setRange(1, 12)
-      self.max_forms_spin.setValue(self.max_forms)
-      self.max_forms_spin.valueChanged.connect(self._set_max_forms)
-      form_row.addWidget(self.max_forms_spin)
-      form_hint = QtWidgets.QLabel(
-        "N задаёт, на сколько экранов алгоритм может распределить контролы."
-      )
-      form_hint.setWordWrap(True)
-      data_layout.addWidget(form_hint)
-
-      weights_box = QtWidgets.QGroupBox("Приоритеты оптимизации")
-      weights_layout = QtWidgets.QVBoxLayout(weights_box)
-      self.coef = WeightSliders()
-      self.weights = self.coef.weights()
-      self.coef.changed.connect(self._set_weights)
-      weights_layout.addWidget(self.coef)
-      hint = QtWidgets.QLabel(
-        "P, O и R — расчётные свойства готового интерфейса, не вход. "
-        "Здесь задаются только веса свёртки F = w₁P + w₂O + w₃R, сумма всегда равна 1."
-      )
-      hint.setWordWrap(True)
-      weights_layout.addWidget(hint)
-      data_layout.addWidget(weights_box)
+      self.data_tab = DataTaskTab()
+      self.data_tab.maxFormsChanged.connect(self._set_max_forms)
+      self.data_tab.weightsChanged.connect(self._set_weights)
+      self.max_forms = self.data_tab.max_forms
+      self.weights = self.data_tab.coef.weights()
 
       self.task_tab = TaskSettingsTab(self.registry)
       self.alg_tab = AlgorithmsTab()
       self.alg_tab.runRequested.connect(self.run_algorithms)
       self.charts_tab = ChartsTab()
+      self.visualization_tab = VisualizationTab()
+      self.report_tab = ReportTab()
+      self.interpretation_tab = InterpretationTab()
 
       tabs.addTab(self.data_tab, "Данные, тип, длина")
       tabs.addTab(self.alg_tab, "Алгоритмы")
       tabs.addTab(self.task_tab, "Настройка задачи")
       tabs.addTab(self.charts_tab, "Графики")
+      tabs.addTab(self.visualization_tab, "Визуализация")
+      tabs.addTab(self.report_tab, "Отчёт")
+      tabs.addTab(self.interpretation_tab, "Интерпретация")
 
       file_menu = self.menuBar().addMenu("Файл")
       export_action = QtWidgets.QAction("Экспорт веб-страницы", self)
       export_action.triggered.connect(self.export_web)
       file_menu.addAction(export_action)
 
-      self.field_table.add_field("Возраст", DataType.UNSIGNED, 3)
-      self.field_table.add_field("Имя", DataType.TEXT, 16)
-      self.field_table.add_field("Согласие", DataType.BOOLEAN, 1)
-
       self.last_best_layouts: Dict[str, Optional[InterfaceLayout]] = {}
+      self._last_run_summaries: List[AlgorithmRunSummary] = []
+      self._last_report_text = ""
+      self._last_run_cancelled = False
+      self._last_run_warning: Optional[str] = None
       self._worker: Optional[OptimizationWorker] = None
       self._run_control: Optional[OptimizationControl] = None
       self.overlay = ProgressOverlay(self)
       self.overlay.cancelRequested.connect(self._cancel_optimization)
       self.overlay.hide()
-
-    def _add_field(self) -> None:
-      self.field_table.add_field(self.field_table.next_default_field_name(), DataType.TEXT, 16)
-
-    def _remove_selected_field(self) -> None:
-      rows = sorted({i.row() for i in self.field_table.selectedIndexes()}, reverse=True)
-      for r in rows:
-        self.field_table.removeRow(r)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
       super().resizeEvent(event)
@@ -1102,9 +1573,9 @@ if _HAS_PYQT5:
       self.max_forms = int(value)
 
     def _build_space(self) -> Tuple[DecisionSpace, ObjectiveEvaluator]:
-      self.coef.commit()
-      self.weights = self.coef.weights()
-      fields = self.field_table.fields()
+      self.data_tab.coef.commit()
+      self.weights = self.data_tab.coef.weights()
+      fields = self.data_tab.field_table.fields()
       _ensure_allowed_controls(fields)
       space = DecisionSpace(fields, max_forms=self.max_forms)
       evaluator = ObjectiveEvaluator(self.registry, self.weights)
@@ -1140,16 +1611,48 @@ if _HAS_PYQT5:
       for key, _label in SUITE_STEPS:
         payload_one = results.get(key) or {}
         self.last_best_layouts[key] = payload_one.get("best_layout")
+      summaries = build_algorithm_summaries(results, self.registry, self.weights)
+      self._last_run_summaries = summaries
       self.charts_tab.plot_histories(histories_from_results(results))
       result_rows: List[Tuple[str, Optional[EfficiencyTriple], float, int]] = []
-      for name, layout in self.last_best_layouts.items():
-        if layout is None:
-          result_rows.append((name, None, 0.0, 0))
+      for item in sorted(
+        summaries,
+        key=lambda s: (s.fitness if s.layout is not None else -1.0),
+        reverse=True,
+      ):
+        if item.layout is None:
+          result_rows.append((item.key, None, 0.0, 0))
           continue
-        triple = compute_total_efficiency(layout, self.registry)
-        fitness = calculate_fitness(triple, self.weights)
-        result_rows.append((name, triple, fitness, layout.form_count))
+        result_rows.append((item.key, item.triple, item.fitness, item.form_count))
       self.charts_tab.show_results(self.weights, result_rows)
+      self.visualization_tab.show_results(summaries)
+      fields = self.data_tab.field_table.fields()
+      total_elapsed = data.get("total_elapsed_s")
+      total_elapsed_s = float(total_elapsed) if total_elapsed is not None else None
+      report_text = format_optimization_report(
+        summaries,
+        weights=self.weights,
+        field_count=len(fields),
+        max_forms=self.max_forms,
+        cancelled=cancelled,
+        warning=str(warning) if warning else None,
+        optiflow_version=__version__,
+        total_elapsed_s=total_elapsed_s,
+        fields=fields,
+      )
+      self.report_tab.show_report(report_text)
+      self._last_report_text = report_text
+      self._last_run_cancelled = cancelled
+      self._last_run_warning = str(warning) if warning else None
+      self.interpretation_tab.set_run_context(
+        summaries=summaries,
+        report_text=report_text,
+        fields=self.data_tab.field_table.fields(),
+        max_forms=self.max_forms,
+        weights=self.weights,
+        cancelled=cancelled,
+        warning=self._last_run_warning,
+      )
       self.overlay.stop()
       self.alg_tab.set_run_enabled(True)
       if warning:
@@ -1162,7 +1665,7 @@ if _HAS_PYQT5:
         )
       tabs = self.centralWidget()
       if isinstance(tabs, QtWidgets.QTabWidget):
-        tabs.setCurrentWidget(self.charts_tab)
+        tabs.setCurrentWidget(self.visualization_tab)
 
     def _on_suite_failed(self, message: str) -> None:
       self.overlay.stop()
@@ -1207,7 +1710,7 @@ if _HAS_PYQT5:
           layout = self.last_best_layouts[key]
           break
       if layout is None:
-        fields = self.field_table.fields()
+        fields = self.data_tab.field_table.fields()
         if not fields:
           QtWidgets.QMessageBox.warning(self, "Экспорт", "Добавьте поля или запустите алгоритмы")
           return
