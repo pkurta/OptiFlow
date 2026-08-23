@@ -330,6 +330,28 @@ if _HAS_PYQT5:
       self.setHorizontalHeaderLabels(["Имя", "Тип данных", "Размер"])
       self.horizontalHeader().setStretchLastSection(True)
 
+    def _sync_size_widget(self, row: int) -> None:
+      combo: QtWidgets.QComboBox = self.cellWidget(row, 1)  # type: ignore
+      spin: QtWidgets.QSpinBox = self.cellWidget(row, 2)  # type: ignore
+      if combo is None or spin is None:
+        return
+      if combo.currentData() == DataType.BOOLEAN:
+        spin.setValue(1)
+        spin.setReadOnly(True)
+        spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+      else:
+        spin.setReadOnly(False)
+        spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.UpDownArrows)
+
+    def _on_dtype_changed(self) -> None:
+      combo = self.sender()
+      if not isinstance(combo, QtWidgets.QComboBox):
+        return
+      for row in range(self.rowCount()):
+        if self.cellWidget(row, 1) is combo:
+          self._sync_size_widget(row)
+          return
+
     def add_field(self, name: str, dtype: DataType, size: int) -> None:
       row = self.rowCount()
       self.insertRow(row)
@@ -338,11 +360,13 @@ if _HAS_PYQT5:
       for dt in DataType:
         combo.addItem(dt.name, dt)
       combo.setCurrentText(dtype.name)
+      combo.currentIndexChanged.connect(self._on_dtype_changed)
       self.setCellWidget(row, 1, combo)
       spin = QtWidgets.QSpinBox()
       spin.setRange(1, 1000000)
-      spin.setValue(size)
+      spin.setValue(1 if dtype == DataType.BOOLEAN else size)
       self.setCellWidget(row, 2, spin)
+      self._sync_size_widget(row)
 
     def next_default_field_name(self) -> str:
       prefix = "Поле "
@@ -371,7 +395,7 @@ if _HAS_PYQT5:
         combo: QtWidgets.QComboBox = self.cellWidget(row, 1)  # type: ignore
         dtype = combo.currentData()
         size_widget: QtWidgets.QSpinBox = self.cellWidget(row, 2)  # type: ignore
-        size = size_widget.value()
+        size = 1 if dtype == DataType.BOOLEAN else size_widget.value()
         result.append(FieldSpec(name=name, data_type=dtype, size=size))
       return result
 
