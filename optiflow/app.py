@@ -1188,6 +1188,20 @@ if _HAS_PYQT5:
         self.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+  # Стили серий: цвет + linestyle + marker — тройная кодировка против наложения плато.
+  _CHART_SERIES_STYLES: Tuple[Tuple[str, str, str], ...] = (
+    ("#1f77b4", "-", "o"),
+    ("#ff7f0e", "--", "s"),
+    ("#2ca02c", "-.", "^"),
+    ("#d62728", ":", "D"),
+    ("#9467bd", "-", "v"),
+    ("#8c564b", "--", "P"),
+    ("#e377c2", "-.", "X"),
+    ("#7f7f7f", ":", "*"),
+    ("#bcbd22", "-", "h"),
+    ("#17becf", "--", "d"),
+  )
+
   class ChartsTab(QtWidgets.QWidget):
     def __init__(self, parent=None) -> None:
       super().__init__(parent)
@@ -1198,7 +1212,28 @@ if _HAS_PYQT5:
 
       self.figure = Figure(figsize=(5, 4), dpi=100)
       self.canvas = FigureCanvas(self.figure)
+      self._histories: List[Tuple[str, List[float]]] = []
+      self._line_by_label: Dict[str, object] = {}
+      self._legend = None
+      self._hover_cid: Optional[int] = None
+      self._pick_cid: Optional[int] = None
+      self._hovered_legend_idx: Optional[int] = None
+
       layout = QtWidgets.QVBoxLayout(self)
+      controls = QtWidgets.QHBoxLayout()
+      controls.addWidget(QtWidgets.QLabel("Отображение:"))
+      self.filter_combo = QtWidgets.QComboBox()
+      self.filter_combo.addItem("Топ-3 по итоговому F", "top3")
+      self.filter_combo.addItem("Все алгоритмы", "all")
+      self.filter_combo.setCurrentIndex(0)
+      self.filter_combo.currentIndexChanged.connect(self._redraw)
+      controls.addWidget(self.filter_combo)
+      hint = QtWidgets.QLabel(
+        "Клик по легенде — вкл/выкл серию · наведение — выделить кривую"
+      )
+      hint.setStyleSheet("color: #666;")
+      controls.addWidget(hint, stretch=1)
+      layout.addLayout(controls)
       layout.addWidget(self.canvas)
       self.results_label = QtWidgets.QLabel(
         "Запустите алгоритмы, чтобы увидеть расчётные P, O, R выбранных решений."
@@ -1208,14 +1243,120 @@ if _HAS_PYQT5:
       layout.addWidget(self.results_label)
 
     def plot_histories(self, histories: List[Tuple[str, List[float]]]) -> None:
+      self._histories = list(histories)
+      self._redraw()
+
+    def _final_fitness(self, history: List[float]) -> float:
+      return float(history[-1]) if history else float("-inf")
+
+    def _visible_histories(self) -> List[Tuple[str, List[float]]]:
+      mode = str(self.filter_combo.currentData() or "top3")
+      if mode != "top3" or len(self._histories) <= 3:
+        return list(self._histories)
+      ranked = sorted(
+        self._histories,
+        key=lambda item: self._final_fitness(item[1]),
+        reverse=True,
+      )
+      return ranked[:3]
+
+    def _redraw(self) -> None:
       self.figure.clear()
+      self._line_by_label = {}
+      self._hovered_legend_idx = None
+      if self._hover_cid is not None:
+        self.canvas.mpl_disconnect(self._hover_cid)
+        self._hover_cid = None
+      if self._pick_cid is not None:
+        self.canvas.mpl_disconnect(self._pick_cid)
+        self._pick_cid = None
+
       ax = self.figure.add_subplot(111)
-      for label, history in histories:
-        ax.plot(history, label=label)
-      ax.set_title("Сравнение (скалярная пригодность F = w₁P + w₂O + w₃R)")
+      visible = self._visible_histories()
+      if not visible:
+        ax.set_title("Скорость выхода на плато F (нет данных)")
+        ax.set_xlabel("Итерации")
+        ax.set_ylabel("Скалярная пригодность F")
+        self.canvas.draw_idle()
+        return
+
+      for idx, (label, history) in enumerate(visible):
+        color, linestyle, marker = _CHART_SERIES_STYLES[idx % len(_CHART_SERIES_STYLES)]
+        markevery = max(1, len(history) // 12) if history else 1
+        (line,) = ax.plot(
+          history,
+          label=label,
+          color=color,
+          linestyle=linestyle,
+          linewidth=2.0,
+          marker=marker,
+          markersize=5.5,
+          markevery=markevery,
+          alpha=0.95,
+          picker=True,
+          pickradius=5,
+        )
+        self._line_by_label[label] = line
+
+      ax.set_title("Скорость выхода на плато (F = w₁P + w₂O + w₃R)")
       ax.set_xlabel("Итерации")
       ax.set_ylabel("Скалярная пригодность F")
-      ax.legend()
+      self._legend = ax.legend(loc="best", framealpha=0.92)
+      if self._legend is not None:
+        for legend_line in self._legend.get_lines():
+          legend_line.set_picker(True)
+          legend_line.set_pickradius(8)
+      self._pick_cid = self.canvas.mpl_connect("pick_event", self._on_legend_pick)
+      self._hover_cid = self.canvas.mpl_connect(
+        "motion_notify_event", self._on_legend_hover
+      )
+      self.figure.tight_layout()
+      self.canvas.draw_idle()
+
+    def _on_legend_pick(self, event) -> None:
+      artist = getattr(event, "artist", None)
+      if artist is None or self._legend is None:
+        return
+      legend_lines = list(self._legend.get_lines())
+      if artist not in legend_lines:
+        return
+      idx = legend_lines.index(artist)
+      labels = list(self._line_by_label.keys())
+      if idx >= len(labels):
+        return
+      line = self._line_by_label[labels[idx]]
+      visible = not bool(line.get_visible())
+      line.set_visible(visible)
+      artist.set_alpha(1.0 if visible else 0.25)
+      self.canvas.draw_idle()
+
+    def _on_legend_hover(self, event) -> None:
+      if self._legend is None or not self._line_by_label:
+        return
+      legend_lines = list(self._legend.get_lines())
+      hovered_idx: Optional[int] = None
+      for idx, legend_line in enumerate(legend_lines):
+        contains, _ = legend_line.contains(event)
+        if contains:
+          hovered_idx = idx
+          break
+      if hovered_idx == self._hovered_legend_idx:
+        return
+      self._hovered_legend_idx = hovered_idx
+      labels = list(self._line_by_label.keys())
+      for idx, label in enumerate(labels):
+        line = self._line_by_label[label]
+        if not line.get_visible():
+          continue
+        if hovered_idx is None:
+          line.set_alpha(0.95)
+          line.set_linewidth(2.0)
+        elif idx == hovered_idx:
+          line.set_alpha(1.0)
+          line.set_linewidth(3.0)
+        else:
+          line.set_alpha(0.18)
+          line.set_linewidth(1.5)
       self.canvas.draw_idle()
 
     def show_results(
@@ -1230,7 +1371,7 @@ if _HAS_PYQT5:
           f"w₂ оперативность={w2:.2f}, w₃ ресурсоэкономность={w3:.2f} "
           f"(Σ={w1 + w2 + w3:.2f})"
         ),
-        "Эффективность сгенерированного интерфейса (выход):",
+        "Эффективность сгенерированного интерфейса (выход), сортировка по F:",
       ]
       for name, triple, fitness, form_count in rows:
         if triple is None:
