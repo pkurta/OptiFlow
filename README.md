@@ -52,6 +52,7 @@ $$
 | Компонент | Назначение |
 |-----------|------------|
 | `optiflow/models/scoring.py` | Типы данных, layout wizard, `FunctionRegistry`, расчёт \(P,O,R\) |
+| `optiflow/models/layout_io.py` | JSON синтезированного wizard (`optiflow-interface-layout`) |
 | `optiflow/optimization/algorithms.py` | Метаэвристики, `CriterionWeights`, `calculate_fitness()` |
 | `optiflow/optimization/runner.py` | Suite-прогон алгоритмов, контроль времени/итераций |
 | `optiflow/benchmarks.py` | Monte Carlo-бенчмарк, Precision Rate vs Brute Force |
@@ -89,7 +90,7 @@ Suite запускается последовательно из GUI (вклад
 
 ## Интерфейс
 
-![Постановка задачи: поля, веса, число экранов](docs/screenshots/optiflow_01_data.webp)
+![Постановка задачи: поля, веса \(1/3\) в «Балансе», сценарии «Упор на …»](docs/screenshots/optiflow_01_data.webp)
 
 ![Запуск suite метаэвристик](docs/screenshots/optiflow_02_algorithms.webp)
 
@@ -97,13 +98,15 @@ Suite запускается последовательно из GUI (вклад
 
 ![Сходимость алгоритмов к плато \(F\)](docs/screenshots/optiflow_04_charts.webp)
 
-![Предпросмотр синтезированного HTML-мастера](docs/screenshots/optiflow_05_visualization.webp)
+![Предпросмотр синтезированного HTML-мастера; сохранение и загрузка JSON](docs/screenshots/optiflow_05_visualization.webp)
 
 ![Детерминированный отчёт по прогону](docs/screenshots/optiflow_06_report.webp)
 
 ![LLM-интерпретация результатов (Gemini Flash)](docs/screenshots/optiflow_07_interpretation.webp)
 
 **Вкладки (v1.6):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
+
+На вкладке «Данные» сценарий «Баланс» задаёт точные веса \(w_1=w_2=w_3=1/3\); именованные сценарии — «Упор на результативность / оперативность / ресурсоэкономность», без привязки к частным организациям. Синтезированный мастер сохраняется и открывается повторно как JSON (`optiflow-interface-layout`) с вкладки «Визуализация» или из меню «Файл».
 
 **Конфигурация:**
 
@@ -153,10 +156,10 @@ python3 -m optiflow.app
 ### Unit-тесты
 
 ```bash
-python3 -m unittest tests.test_benchmarks -v
+python3 -m unittest tests.test_benchmarks tests.test_layout_io -v
 ```
 
-Проверяются: Brute Force (Ground Truth), Classic GA, нормировка весов, Monte Carlo-бенчмарк.
+Проверяются: Brute Force (Ground Truth), Classic GA, нормировка весов, JSON layout, Monte Carlo-бенчмарк.
 
 ### Monte Carlo-отчёт
 
