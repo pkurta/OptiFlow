@@ -74,6 +74,27 @@ class CriterionWeightsTests(unittest.TestCase):
     weights = CriterionWeights.from_raw(*WEIGHT_PRESETS[DEFAULT_WEIGHT_PRESET])
     self.assertTrue(weights.is_equal())
 
+  def test_legacy_organisation_preset_aliases_resolve(self) -> None:
+    from optiflow.optimization.algorithms import (
+      WEIGHT_PRESETS,
+      resolve_weight_preset,
+    )
+
+    self.assertEqual(
+      resolve_weight_preset("Call-центр / МЧС — упор на оперативность"),
+      "Упор на оперативность",
+    )
+    self.assertEqual(
+      resolve_weight_preset("Банк — упор на результативность"),
+      "Упор на результативность",
+    )
+    self.assertEqual(
+      resolve_weight_preset("Массовый сервис — упор на ресурсоэкономность"),
+      "Упор на ресурсоэкономность",
+    )
+    self.assertIn("Упор на оперативность", WEIGHT_PRESETS)
+    self.assertNotIn("Call-центр / МЧС — упор на оперативность", WEIGHT_PRESETS)
+
   def test_redistribute_keeps_unit_simplex(self) -> None:
     ticks = redistribute_weight_ticks((34, 33, 33), 0, 70)
     self.assertEqual(sum(ticks), 100)

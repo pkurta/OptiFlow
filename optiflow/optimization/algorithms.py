@@ -71,13 +71,25 @@ _ONE_THIRD = 1.0 / 3.0
 
 WEIGHT_PRESETS: Dict[str, Tuple[float, float, float]] = {
   "Баланс — все критерии равны": (_ONE_THIRD, _ONE_THIRD, _ONE_THIRD),
-  "Банк — упор на результативность": (0.70, 0.20, 0.10),
-  "Call-центр / МЧС — упор на оперативность": (0.20, 0.70, 0.10),
-  "Массовый сервис — упор на ресурсоэкономность": (0.20, 0.10, 0.70),
+  "Упор на результативность": (0.70, 0.20, 0.10),
+  "Упор на оперативность": (0.20, 0.70, 0.10),
+  "Упор на ресурсоэкономность": (0.20, 0.10, 0.70),
+}
+
+# Old dropdown labels with organisation examples; keep so saved JSON still loads.
+LEGACY_WEIGHT_PRESET_ALIASES: Dict[str, str] = {
+  "Банк — упор на результативность": "Упор на результативность",
+  "Call-центр / МЧС — упор на оперативность": "Упор на оперативность",
+  "Массовый сервис — упор на ресурсоэкономность": "Упор на ресурсоэкономность",
 }
 
 CUSTOM_WEIGHT_PRESET = "Свой вариант"
 DEFAULT_WEIGHT_PRESET = "Баланс — все критерии равны"
+
+
+def resolve_weight_preset(name: str) -> str:
+  """Map a saved or UI preset label onto a current WEIGHT_PRESETS key."""
+  return LEGACY_WEIGHT_PRESET_ALIASES.get(name, name)
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,7 @@ from optiflow.optimization.algorithms import (
   pso,
   random_search,
   redistribute_weight_ticks,
+  resolve_weight_preset,
   simulated_annealing,
   tabu_search,
 )
@@ -427,6 +428,7 @@ if _HAS_PYQT5:
       return self.preset_combo.currentText()
 
     def apply_preset_or_weights(self, preset: str, weights: CriterionWeights) -> None:
+      preset = resolve_weight_preset(preset)
       if preset in WEIGHT_PRESETS:
         self.preset_combo.blockSignals(True)
         self.preset_combo.setCurrentText(preset)
@@ -1973,7 +1975,7 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
   registry = FunctionRegistry()
   fields = mock_demo_fields()
   max_forms = 3
-  weights = CriterionWeights.from_raw(*WEIGHT_PRESETS["Call-центр / МЧС — упор на оперативность"])
+  weights = CriterionWeights.from_raw(*WEIGHT_PRESETS["Упор на оперативность"])
   space = DecisionSpace(fields, max_forms=max_forms)
   evaluator = ObjectiveEvaluator(registry, weights)
 
