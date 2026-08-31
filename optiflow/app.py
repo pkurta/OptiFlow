@@ -6,7 +6,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from optiflow import __version__
 from optiflow.models.scoring import (
@@ -152,6 +152,14 @@ _DIM_WEIGHT_LABELS = (
   "Вес оперативности",
   "Вес ресурсоэкономности",
 )
+# Integer ticks cannot represent 1/3 + 1/3 + 1/3 = 1. For the Balance preset
+# all three handles sit on the same tick so equality is visible; the model
+# still uses exact 1/3.
+_EQUAL_WEIGHT_DISPLAY_TICK = 33
+_BALANCE_SLIDER_TIP = (
+  "В сценарии «Баланс» веса равны точно 1/3. "
+  "Перемещение ползунка включает «Свой вариант»."
+)
 
 # Итерационный параметр и дефолт для вкладки «Настройка задачи».
 # None — алгоритм без настраиваемого лимита итераций.
@@ -240,6 +248,7 @@ if _HAS_PYQT5:
         lbl.setMinimumWidth(label_width)
         lbl.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Preferred)
         slider = _CommitSlider(self)
+        slider.setToolTip(_BALANCE_SLIDER_TIP)
         slider.valueChanged.connect(self._on_slider_changed)
         slider.gestureStarted.connect(self._on_gesture_started)
         slider.gestureFinished.connect(self._on_gesture_finished)
@@ -265,19 +274,46 @@ if _HAS_PYQT5:
         return True
       return any(s.is_mouse_down() for s in self.sliders)
 
+    def _is_balance_preset(self) -> bool:
+      return self.preset_combo.currentText() == DEFAULT_WEIGHT_PRESET
+
+    def _equal_illustration_ticks(self, ticks: Sequence[int]) -> bool:
+      return (
+        len(ticks) == 3
+        and ticks[0] == ticks[1] == ticks[2] == _EQUAL_WEIGHT_DISPLAY_TICK
+      )
+
+    def _apply_equal_illustration(self) -> None:
+      self._updating = True
+      for slider in self.sliders:
+        slider.setValue(_EQUAL_WEIGHT_DISPLAY_TICK)
+      self._updating = False
+      self._refresh_slider_tooltips()
+
+    def _refresh_slider_tooltips(self) -> None:
+      tip = _BALANCE_SLIDER_TIP if self._is_balance_preset() else ""
+      for slider in self.sliders:
+        slider.setToolTip(tip)
+
     def weights(self) -> CriterionWeights:
+      if self._is_balance_preset():
+        return CriterionWeights.balanced()
       return CriterionWeights.from_ticks(*(s.value() for s in self.sliders))
 
     def set_weights(self, weights: CriterionWeights, *, mark_custom: bool = True) -> None:
       self._pending_index = None
       self._frozen_ticks = None
-      ticks = weights.to_ticks()
+      if not mark_custom and self._is_balance_preset():
+        ticks = (_EQUAL_WEIGHT_DISPLAY_TICK,) * 3
+      else:
+        ticks = weights.to_ticks()
       self._updating = True
       for slider, tick in zip(self.sliders, ticks):
         slider.setValue(tick)
       self._updating = False
       if mark_custom:
         self._mark_custom_preset()
+      self._refresh_slider_tooltips()
       self._refresh_all_labels()
 
     def commit(self) -> None:
@@ -288,6 +324,14 @@ if _HAS_PYQT5:
       if self._frozen_ticks is not None and idx is not None:
         ticks = list(self._frozen_ticks)
         ticks[idx] = self.sliders[idx].value()
+      # 33+33+33 cannot sit on the 100-tick simplex; keep the equal illustration
+      # instead of promoting one handle to 0.34.
+      if self._equal_illustration_ticks(ticks):
+        self._pending_index = None
+        self._frozen_ticks = None
+        self._apply_equal_illustration()
+        self._refresh_all_labels()
+        return
       if idx is None:
         if sum(ticks) == 100:
           self._frozen_ticks = None
@@ -304,6 +348,7 @@ if _HAS_PYQT5:
             slider.setValue(tick)
         self._updating = False
         self._mark_custom_preset()
+      self._refresh_slider_tooltips()
       self._refresh_all_labels()
       self.changed.emit(self.weights())
 
@@ -323,7 +368,11 @@ if _HAS_PYQT5:
       self.commit()
 
     def _on_preset_changed(self, name: str) -> None:
-      if name == CUSTOM_WEIGHT_PRESET or name not in WEIGHT_PRESETS:
+      if name == CUSTOM_WEIGHT_PRESET:
+        self._refresh_slider_tooltips()
+        self._refresh_all_labels()
+        return
+      if name not in WEIGHT_PRESETS:
         return
       self.set_weights(CriterionWeights.from_raw(*WEIGHT_PRESETS[name]), mark_custom=False)
       self.changed.emit(self.weights())
@@ -355,9 +404,17 @@ if _HAS_PYQT5:
           if other != idx and self.sliders[other].value() != frozen:
             self.sliders[other].setValue(frozen)
         self._updating = False
+      if self._is_balance_preset() and sender.value() != _EQUAL_WEIGHT_DISPLAY_TICK:
+        self._mark_custom_preset()
+        self._refresh_slider_tooltips()
+        self._refresh_all_labels()
+        return
       self._refresh_label(idx)
 
     def _refresh_label(self, index: int) -> None:
+      if self._is_balance_preset():
+        self.labels[index].setText(f"{_DIM_WEIGHT_LABELS[index]}: 1/3")
+        return
       tick = self.sliders[index].value()
       self.labels[index].setText(f"{_DIM_WEIGHT_LABELS[index]}: {tick / 100.0:.2f}")
 
@@ -538,7 +595,8 @@ if _HAS_PYQT5:
       weights_layout.addWidget(self.coef)
       hint = QtWidgets.QLabel(
         "P, O и R — расчётные свойства готового интерфейса, не вход. "
-        "Здесь задаются только веса свёртки F = w₁P + w₂O + w₃R, сумма всегда равна 1."
+        "Здесь задаются только веса свёртки F = w₁P + w₂O + w₃R, сумма всегда равна 1. "
+        "В сценарии «Баланс» веса равны точно 1/3; два знака после запятой — в «Свой вариант»."
       )
       hint.setWordWrap(True)
       weights_layout.addWidget(hint)
@@ -1364,12 +1422,12 @@ if _HAS_PYQT5:
       weights: CriterionWeights,
       rows: List[Tuple[str, Optional[EfficiencyTriple], float, int]],
     ) -> None:
-      w1, w2, w3 = weights.as_tuple()
+      w1, w2, w3 = weights.display_parts(digits=2)
       lines = [
         (
-          f"Веса (вход): w₁ результативность={w1:.2f}, "
-          f"w₂ оперативность={w2:.2f}, w₃ ресурсоэкономность={w3:.2f} "
-          f"(Σ={w1 + w2 + w3:.2f})"
+          f"Веса (вход): w₁ результативность={w1}, "
+          f"w₂ оперативность={w2}, w₃ ресурсоэкономность={w3} "
+          f"(Σ=1)"
         ),
         "Эффективность сгенерированного интерфейса (выход), сортировка по F:",
       ]
@@ -1974,11 +2032,11 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
     best_name = "fallback"
 
   assert best_layout is not None and best_triple is not None
-  w1, w2, w3 = weights.as_tuple()
+  w1, w2, w3 = weights.display_parts(digits=2)
   print(
     f"[{best_name}] F={best_fitness:.4f} "
     f"P={best_triple.potency:.3f} O={best_triple.operativeness:.3f} R={best_triple.resource_saving:.3f} "
-    f"weights=({w1:.2f},{w2:.2f},{w3:.2f}) forms={best_layout.form_count}"
+    f"weights=({w1},{w2},{w3}) forms={best_layout.form_count}"
   )
 
   html = generate_html_from_layout(best_layout)

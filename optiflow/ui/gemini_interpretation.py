@@ -117,7 +117,7 @@ def build_interpretation_prompt(
   warning: Optional[str],
   optiflow_version: str,
 ) -> str:
-  w1, w2, w3 = weights.as_tuple()
+  w1, w2, w3 = weights.display_parts(digits=3)
   field_lines = [
     (
       f"  - {field.name}: тип={field.data_type.name}, размер={field.size}, "
@@ -165,7 +165,7 @@ def build_interpretation_prompt(
 {chr(10).join(field_lines) if field_lines else "  (нет полей)"}
 
 Макс. число экранов мастера (N): {max_forms}
-Веса свёртки: w₁={w1:.3f} (результативность), w₂={w2:.3f} (оперативность), w₃={w3:.3f} (ресурсоэкономность)
+Веса свёртки: w₁={w1} (результативность), w₂={w2} (оперативность), w₃={w3} (ресурсоэкономность)
 
 Статус прогона: {"прерван пользователем" if cancelled else "завершён полностью"}
 {f"Предупреждение системы: {warning}" if warning else ""}

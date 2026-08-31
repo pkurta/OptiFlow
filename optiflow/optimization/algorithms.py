@@ -67,8 +67,10 @@ class TargetProfile:
     )
 
 
+_ONE_THIRD = 1.0 / 3.0
+
 WEIGHT_PRESETS: Dict[str, Tuple[float, float, float]] = {
-  "Баланс — все критерии равны": (0.34, 0.33, 0.33),
+  "Баланс — все критерии равны": (_ONE_THIRD, _ONE_THIRD, _ONE_THIRD),
   "Банк — упор на результативность": (0.70, 0.20, 0.10),
   "Call-центр / МЧС — упор на оперативность": (0.20, 0.70, 0.10),
   "Массовый сервис — упор на ресурсоэкономность": (0.20, 0.10, 0.70),
@@ -89,17 +91,28 @@ class CriterionWeights:
   def as_tuple(self) -> Tuple[float, float, float]:
     return (self.w_potency, self.w_operativeness, self.w_resource_saving)
 
+  def is_equal(self, tol: float = 1e-12) -> bool:
+    """True when the simplex point is exactly equal weights (1/3, 1/3, 1/3)."""
+    return all(abs(value - _ONE_THIRD) <= tol for value in self.as_tuple())
+
+  def display_parts(self, digits: int = 2) -> Tuple[str, str, str]:
+    """Labels for UI and reports: equality as 1/3, otherwise decimal rounding."""
+    if self.is_equal():
+      return ("1/3", "1/3", "1/3")
+    w1, w2, w3 = self.as_tuple()
+    return (f"{w1:.{digits}f}", f"{w2:.{digits}f}", f"{w3:.{digits}f}")
+
   @classmethod
   def from_raw(cls, w1: float, w2: float, w3: float) -> "CriterionWeights":
     a, b, c = max(0.0, float(w1)), max(0.0, float(w2)), max(0.0, float(w3))
     total = a + b + c
     if total <= 0.0:
-      return cls(1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0)
+      return cls.balanced()
     return cls(a / total, b / total, c / total)
 
   @classmethod
   def balanced(cls) -> "CriterionWeights":
-    return cls.from_raw(*WEIGHT_PRESETS[DEFAULT_WEIGHT_PRESET])
+    return cls(_ONE_THIRD, _ONE_THIRD, _ONE_THIRD)
 
   @classmethod
   def from_ticks(cls, t1: int, t2: int, t3: int) -> "CriterionWeights":

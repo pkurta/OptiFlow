@@ -55,10 +55,35 @@ class CriterionWeightsTests(unittest.TestCase):
     restored = CriterionWeights.from_ticks(*ticks)
     self.assertAlmostEqual(sum(restored.as_tuple()), 1.0)
 
+  def test_balanced_weights_are_exactly_one_third(self) -> None:
+    weights = CriterionWeights.balanced()
+    self.assertTrue(weights.is_equal())
+    for value in weights.as_tuple():
+      self.assertAlmostEqual(value, 1.0 / 3.0)
+    self.assertEqual(weights.display_parts(), ("1/3", "1/3", "1/3"))
+    self.assertAlmostEqual(sum(weights.as_tuple()), 1.0)
+
+  def test_legacy_rounded_balance_is_not_equal(self) -> None:
+    weights = CriterionWeights.from_raw(0.34, 0.33, 0.33)
+    self.assertFalse(weights.is_equal())
+    self.assertEqual(weights.display_parts(digits=2), ("0.34", "0.33", "0.33"))
+
+  def test_balance_preset_tuple_is_equal(self) -> None:
+    from optiflow.optimization.algorithms import DEFAULT_WEIGHT_PRESET, WEIGHT_PRESETS
+
+    weights = CriterionWeights.from_raw(*WEIGHT_PRESETS[DEFAULT_WEIGHT_PRESET])
+    self.assertTrue(weights.is_equal())
+
   def test_redistribute_keeps_unit_simplex(self) -> None:
     ticks = redistribute_weight_ticks((34, 33, 33), 0, 70)
     self.assertEqual(sum(ticks), 100)
     self.assertEqual(ticks[0], 70)
+
+  def test_redistribute_from_equal_illustration_sums_to_100(self) -> None:
+    ticks = redistribute_weight_ticks((33, 33, 33), 0, 50)
+    self.assertEqual(sum(ticks), 100)
+    self.assertEqual(ticks[0], 50)
+    self.assertEqual(ticks[1], ticks[2])
 
   def test_calculate_fitness_is_weighted_sum_minus_penalties(self) -> None:
     triple = EfficiencyTriple(0.8, 0.4, 0.2)

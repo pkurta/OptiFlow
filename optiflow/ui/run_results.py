@@ -91,7 +91,8 @@ def describe_solution_layout(layout: InterfaceLayout) -> str:
   return "\n".join(lines) if lines else "    (пустой layout)"
 
 
-def _plain_scoring_explanation(*, field_count: int, max_forms: int, w1: float, w2: float, w3: float) -> List[str]:
+def _plain_scoring_explanation(*, field_count: int, max_forms: int, weights: CriterionWeights) -> List[str]:
+  w1, w2, w3 = weights.display_parts(digits=2)
   return [
     "Как устроено решение и оценка (на пальцах)",
     "-" * 52,
@@ -107,7 +108,7 @@ def _plain_scoring_explanation(*, field_count: int, max_forms: int, w1: float, w
     "     и элементам (мультипликативная модель когнитивной нагрузки).",
     (
       f"  6. Для сравнения алгоритмов всё сворачивается в одно число F = "
-      f"{w1:.2f}·P + {w2:.2f}·O + {w3:.2f}·R — чем больше F, тем лучше при ваших весах."
+      f"{w1}·P + {w2}·O + {w3}·R — чем больше F, тем лучше при ваших весах."
     ),
     "",
     "Как представляется лучшее решение алгоритма",
@@ -197,7 +198,7 @@ def format_optimization_report(
   total_elapsed_s: Optional[float] = None,
   fields: Optional[Sequence[FieldSpec]] = None,
 ) -> str:
-  w1, w2, w3 = weights.as_tuple()
+  w1, w2, w3 = weights.display_parts(digits=3)
   lines: List[str] = [
     "OptiFlow — отчёт по прогону оптимизации",
     "=" * 52,
@@ -209,7 +210,7 @@ def format_optimization_report(
     f"  Макс. число экранов мастера (N): {max_forms}",
     (
       f"  Веса свёртки F = w₁P + w₂O + w₃R: "
-      f"w₁={w1:.3f}, w₂={w2:.3f}, w₃={w3:.3f} (Σ={w1 + w2 + w3:.3f})"
+      f"w₁={w1}, w₂={w2}, w₃={w3}"
     ),
   ]
   if fields:
@@ -227,7 +228,7 @@ def format_optimization_report(
     lines.append(f"  Общее время набора алгоритмов: {_format_duration(total_elapsed_s)}")
 
   lines.append("")
-  lines.extend(_plain_scoring_explanation(field_count=field_count, max_forms=max_forms, w1=w1, w2=w2, w3=w3))
+  lines.extend(_plain_scoring_explanation(field_count=field_count, max_forms=max_forms, weights=weights))
 
   by_key = summaries_by_key(summaries)
   best_fitness = max(

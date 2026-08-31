@@ -2,7 +2,7 @@
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
 ![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
-![OptiFlow v1.4](https://img.shields.io/badge/OptiFlow-v1.4-orange.svg)
+![OptiFlow v1.5](https://img.shields.io/badge/OptiFlow-v1.5-orange.svg)
 ![Status Active](https://img.shields.io/badge/status-active-brightgreen.svg)
 
 > *OptiFlow: PyQt5 framework for multi-step UI/wizard combinatorial synthesis via metaheuristics (NSGA-II, GA, PSO, SA, ACO) and multiplicative cognitive scoring model.*
@@ -103,7 +103,7 @@ Suite запускается последовательно из GUI (вклад
 
 ![LLM-интерпретация результатов (Gemini Flash)](docs/screenshots/optiflow_07_interpretation.webp)
 
-**Вкладки (v1.4):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
+**Вкладки (v1.5):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
 
 **Конфигурация:**
 
