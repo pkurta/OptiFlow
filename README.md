@@ -2,7 +2,7 @@
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
 ![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
-![OptiFlow v1.5](https://img.shields.io/badge/OptiFlow-v1.5-orange.svg)
+![OptiFlow v1.6](https://img.shields.io/badge/OptiFlow-v1.6-orange.svg)
 ![Status Active](https://img.shields.io/badge/status-active-brightgreen.svg)
 
 > *OptiFlow: PyQt5 framework for multi-step UI/wizard combinatorial synthesis via metaheuristics (NSGA-II, GA, PSO, SA, ACO) and multiplicative cognitive scoring model.*
@@ -103,7 +103,7 @@ Suite запускается последовательно из GUI (вклад
 
 ![LLM-интерпретация результатов (Gemini Flash)](docs/screenshots/optiflow_07_interpretation.webp)
 
-**Вкладки (v1.5):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
+**Вкладки (v1.6):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
 
 **Конфигурация:**
 
@@ -111,6 +111,7 @@ Suite запускается последовательно из GUI (вклад
 |----------------|--------|------------|
 | [`task_settings.json`](task_settings.json) | `optiflow-task-settings` v2 | `control_functions`, `algorithm_limits` |
 | Экспорт с вкладки «Данные…» | `optiflow-problem-data` v1 | `fields`, `max_forms`, `weights` |
+| Экспорт с вкладки «Визуализация» | `optiflow-interface-layout` v1 | синтезированный wizard: поля, контролы, экраны |
 
 ---
 

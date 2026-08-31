@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="optiflow",
-    version="1.5.0",
+    version="1.6.0",
     packages=find_packages(),
     install_requires=[
         "PyQt5==5.15.10",

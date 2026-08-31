@@ -9,6 +9,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from optiflow import __version__
+from optiflow.models.layout_io import (
+  LOADED_LAYOUT_KEY,
+  fields_to_json,
+  interface_layout_from_payload,
+  interface_layout_to_payload,
+  optional_weights_from_payload,
+)
 from optiflow.models.scoring import (
   ControlType,
   DataType,
@@ -1445,9 +1452,13 @@ if _HAS_PYQT5:
 
 
   class VisualizationTab(QtWidgets.QWidget):
+    saveJsonRequested = QtCore.pyqtSignal()
+    loadJsonRequested = QtCore.pyqtSignal()
+
     def __init__(self, parent=None) -> None:
       super().__init__(parent)
-      self._summaries: List[AlgorithmRunSummary] = []
+      self._suite_summaries: List[AlgorithmRunSummary] = []
+      self._loaded_summary: Optional[AlgorithmRunSummary] = None
       self._preview_dir = Path(tempfile.gettempdir()) / "optiflow_previews"
       self._preview_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1455,13 +1466,26 @@ if _HAS_PYQT5:
       top = QtWidgets.QHBoxLayout()
       top.addWidget(QtWidgets.QLabel("Алгоритм:"))
       self.algorithm_combo = QtWidgets.QComboBox()
-      self.algorithm_combo.setMinimumWidth(360)
+      self.algorithm_combo.setMinimumWidth(280)
       self.algorithm_combo.currentIndexChanged.connect(self._show_selected)
       top.addWidget(self.algorithm_combo, stretch=1)
+      self.save_json_btn = QtWidgets.QPushButton("Сохранить JSON…")
+      self.save_json_btn.setToolTip(
+        "Сохранить выбранный синтезированный интерфейс (поля, контролы, экраны)."
+      )
+      self.save_json_btn.clicked.connect(self.saveJsonRequested.emit)
+      top.addWidget(self.save_json_btn)
+      self.load_json_btn = QtWidgets.QPushButton("Загрузить JSON…")
+      self.load_json_btn.setToolTip(
+        "Открыть ранее сохранённый интерфейс без повторного запуска оптимизации."
+      )
+      self.load_json_btn.clicked.connect(self.loadJsonRequested.emit)
+      top.addWidget(self.load_json_btn)
       layout.addLayout(top)
 
       self.metrics_label = QtWidgets.QLabel(
-        "Запустите оптимизацию, чтобы просмотреть сгенерированные интерфейсы."
+        "Запустите оптимизацию или загрузите JSON интерфейса, "
+        "чтобы просмотреть мастер."
       )
       self.metrics_label.setWordWrap(True)
       layout.addWidget(self.metrics_label)
@@ -1480,37 +1504,67 @@ if _HAS_PYQT5:
         self.fallback_browser = QtWidgets.QTextBrowser()
         self.fallback_browser.setOpenExternalLinks(True)
         layout.addWidget(self.fallback_browser, stretch=1)
+      self._sync_save_enabled()
+
+    def _visible_summaries(self) -> List[AlgorithmRunSummary]:
+      items: List[AlgorithmRunSummary] = []
+      if self._loaded_summary is not None and self._loaded_summary.layout is not None:
+        items.append(self._loaded_summary)
+      items.extend(summaries_with_layouts(self._suite_summaries))
+      return items
+
+    def current_summary(self) -> Optional[AlgorithmRunSummary]:
+      if self.algorithm_combo.count() == 0:
+        return None
+      key = self.algorithm_combo.currentData()
+      return next((item for item in self._visible_summaries() if item.key == key), None)
+
+    def _sync_save_enabled(self) -> None:
+      self.save_json_btn.setEnabled(self.current_summary() is not None)
 
     def show_results(self, summaries: List[AlgorithmRunSummary]) -> None:
-      self._summaries = sorted(
+      self._suite_summaries = sorted(
         summaries_with_layouts(summaries),
         key=lambda item: item.fitness,
         reverse=True,
       )
+      select_key = self._suite_summaries[0].key if self._suite_summaries else None
+      self._rebuild_combo(select_key=select_key)
+
+    def show_loaded(self, summary: AlgorithmRunSummary) -> None:
+      self._loaded_summary = summary
+      self._rebuild_combo(select_key=summary.key)
+
+    def _rebuild_combo(self, select_key: Optional[str] = None) -> None:
+      items = self._visible_summaries()
+      previous = select_key or self.algorithm_combo.currentData()
       self.algorithm_combo.blockSignals(True)
       self.algorithm_combo.clear()
-      for item in self._summaries:
+      for item in items:
         self.algorithm_combo.addItem(
           f"{item.label} — F={item.fitness:.4f}",
           item.key,
         )
+      if items:
+        index = next((i for i, item in enumerate(items) if item.key == previous), 0)
+        self.algorithm_combo.setCurrentIndex(index)
       self.algorithm_combo.blockSignals(False)
-      if self._summaries:
-        self.algorithm_combo.setCurrentIndex(0)
+      if items:
         self._show_selected()
       else:
-        self.metrics_label.setText("Нет алгоритмов с готовым layout для визуализации.")
+        self.metrics_label.setText(
+          "Нет алгоритмов с готовым layout. Запустите оптимизацию или загрузите JSON."
+        )
         if self.web_view is not None and _HAS_WEBENGINE:
           self.web_view.setHtml("<p>Нет данных для отображения.</p>")  # type: ignore[union-attr]
         elif hasattr(self, "fallback_browser"):
           self.fallback_browser.setHtml("<p>Нет данных для отображения.</p>")
+      self._sync_save_enabled()
 
     def _show_selected(self) -> None:
-      if not self._summaries or self.algorithm_combo.count() == 0:
-        return
-      key = self.algorithm_combo.currentData()
-      item = next((s for s in self._summaries if s.key == key), None)
+      item = self.current_summary()
       if item is None or item.layout is None or item.triple is None:
+        self._sync_save_enabled()
         return
       self.metrics_label.setText(
         f"P={item.triple.potency:.3f}  O={item.triple.operativeness:.3f}  "
@@ -1525,6 +1579,7 @@ if _HAS_PYQT5:
         self.web_view.load(QtCore.QUrl.fromLocalFile(str(preview_path.resolve())))  # type: ignore[union-attr]
       elif hasattr(self, "fallback_browser"):
         self.fallback_browser.setHtml(html)
+      self._sync_save_enabled()
 
 
   class ReportTab(QtWidgets.QWidget):
@@ -1723,6 +1778,7 @@ if _HAS_PYQT5:
 
       tabs = QtWidgets.QTabWidget()
       self.setCentralWidget(tabs)
+      self.tabs = tabs
 
       self.data_tab = DataTaskTab()
       self.data_tab.maxFormsChanged.connect(self._set_max_forms)
@@ -1735,6 +1791,8 @@ if _HAS_PYQT5:
       self.alg_tab.runRequested.connect(self.run_algorithms)
       self.charts_tab = ChartsTab()
       self.visualization_tab = VisualizationTab()
+      self.visualization_tab.saveJsonRequested.connect(self.save_interface_json)
+      self.visualization_tab.loadJsonRequested.connect(self.load_interface_json)
       self.report_tab = ReportTab()
       self.interpretation_tab = InterpretationTab()
 
@@ -1750,6 +1808,12 @@ if _HAS_PYQT5:
       export_action = QtWidgets.QAction("Экспорт веб-страницы", self)
       export_action.triggered.connect(self.export_web)
       file_menu.addAction(export_action)
+      save_layout_action = QtWidgets.QAction("Сохранить интерфейс JSON…", self)
+      save_layout_action.triggered.connect(self.save_interface_json)
+      file_menu.addAction(save_layout_action)
+      load_layout_action = QtWidgets.QAction("Загрузить интерфейс JSON…", self)
+      load_layout_action.triggered.connect(self.load_interface_json)
+      file_menu.addAction(load_layout_action)
 
       self.last_best_layouts: Dict[str, Optional[InterfaceLayout]] = {}
       self._last_run_summaries: List[AlgorithmRunSummary] = []
@@ -1880,6 +1944,120 @@ if _HAS_PYQT5:
       self._worker = None
       self._run_control = None
 
+    def save_interface_json(self) -> None:
+      item = self.visualization_tab.current_summary()
+      layout = item.layout if item is not None else None
+      if layout is None:
+        QtWidgets.QMessageBox.warning(
+          self,
+          "Сохранение интерфейса",
+          "Нет синтезированного интерфейса. Запустите оптимизацию или загрузите JSON.",
+        )
+        return
+      suggested = _APP_ROOT / "interface_layout.json"
+      path, _ = QtWidgets.QFileDialog.getSaveFileName(
+        self,
+        "Сохранить интерфейс JSON",
+        str(suggested),
+        "JSON (*.json)",
+      )
+      if not path:
+        return
+      if not path.lower().endswith(".json"):
+        path += ".json"
+      self.data_tab.coef.commit()
+      weights = self.data_tab.coef.weights()
+      triple = item.triple if item is not None else None
+      try:
+        payload = interface_layout_to_payload(
+          layout,
+          optiflow_version=__version__,
+          algorithm_key=item.key if item is not None else "",
+          algorithm_label=item.label if item is not None else "",
+          weight_preset=self.data_tab.coef.current_preset(),
+          weights=weights.as_tuple(),
+          max_forms=self.max_forms,
+          potency=None if triple is None else triple.potency,
+          operativeness=None if triple is None else triple.operativeness,
+          resource_saving=None if triple is None else triple.resource_saving,
+          fitness=None if item is None else item.fitness,
+        )
+        with open(path, "w", encoding="utf-8") as fh:
+          json.dump(payload, fh, ensure_ascii=False, indent=2)
+          fh.write("\n")
+      except Exception as exc:
+        QtWidgets.QMessageBox.critical(
+          self,
+          "Ошибка сохранения",
+          f"Не удалось сохранить интерфейс:\n{exc}",
+        )
+        return
+      QtWidgets.QMessageBox.information(
+        self,
+        "Сохранение интерфейса",
+        f"Сохранено: {path}\nФорм мастера: {layout.form_count}",
+      )
+
+    def load_interface_json(self) -> None:
+      path, _ = QtWidgets.QFileDialog.getOpenFileName(
+        self,
+        "Загрузить интерфейс JSON",
+        str(_APP_ROOT),
+        "JSON (*.json)",
+      )
+      if not path:
+        return
+      try:
+        with open(path, encoding="utf-8") as fh:
+          data = json.load(fh)
+        if not isinstance(data, dict):
+          raise ValueError("Корень JSON-файла должен быть объектом.")
+        layout = interface_layout_from_payload(data)
+      except Exception as exc:
+        QtWidgets.QMessageBox.critical(
+          self,
+          "Ошибка загрузки",
+          f"Не удалось загрузить интерфейс:\n{exc}",
+        )
+        return
+      field_dicts = fields_to_json(layout.fields)
+      self.data_tab.field_table.load_fields(field_dicts)
+      stored_max = int(data.get("max_forms", layout.form_count) or layout.form_count)
+      max_forms = max(1, min(12, max(stored_max, layout.form_count)))
+      self.data_tab.max_forms_spin.setValue(max_forms)
+      self.max_forms = max_forms
+      raw_weights = optional_weights_from_payload(data)
+      preset = str(data.get("weight_preset", CUSTOM_WEIGHT_PRESET))
+      if raw_weights is not None:
+        loaded_weights = CriterionWeights.from_raw(*raw_weights)
+        self.data_tab.coef.apply_preset_or_weights(preset, loaded_weights)
+        self.weights = self.data_tab.coef.weights()
+      _ensure_allowed_controls(layout.fields)
+      triple = compute_total_efficiency(layout, self.registry)
+      fitness = calculate_fitness(triple, self.weights)
+      source_name = Path(path).name
+      summary = AlgorithmRunSummary(
+        key=LOADED_LAYOUT_KEY,
+        label=f"Из файла ({source_name})",
+        layout=layout,
+        triple=triple,
+        fitness=fitness,
+        form_count=layout.form_count,
+        history_steps=0,
+        algo_best_score=fitness,
+        elapsed_s=None,
+        ran=True,
+      )
+      self.last_best_layouts[LOADED_LAYOUT_KEY] = layout
+      self.visualization_tab.show_loaded(summary)
+      self.tabs.setCurrentWidget(self.visualization_tab)
+      QtWidgets.QMessageBox.information(
+        self,
+        "Загрузка интерфейса",
+        f"Загружено: {source_name}\n"
+        f"Полей: {len(layout.fields)}, экранов: {layout.form_count}, F={fitness:.4f}",
+      )
+
     def export_web(self) -> None:
       layout: Optional[InterfaceLayout] = None
       preferred = self.alg_tab.current_algorithm()
@@ -1897,6 +2075,7 @@ if _HAS_PYQT5:
       }
       preferred_key = name_map.get(preferred, preferred)
       key_order = [
+        LOADED_LAYOUT_KEY,
         preferred_key,
         "BruteForce",
         "GA",
