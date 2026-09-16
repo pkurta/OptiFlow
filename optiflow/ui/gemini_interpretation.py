@@ -130,7 +130,14 @@ def build_interpretation_prompt(
     )
     for field in fields
   ]
-  ranked = summaries_with_layouts(list(summaries))
+  # raw_fitness (unclipped), not fitness -- see clip_fitness_for_display: at
+  # D>9N several algorithms can display the same clipped F=0, and this ranking
+  # must still pick the genuinely best one, not just the first in SUITE_STEPS order.
+  ranked = sorted(
+    summaries_with_layouts(list(summaries)),
+    key=lambda item: item.raw_fitness,
+    reverse=True,
+  )
   leader_block = ""
   if ranked:
     leader = ranked[0]
