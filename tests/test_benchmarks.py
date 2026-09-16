@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from typing import List
 
+import numpy as np
+
 from optiflow.benchmarks import (
   BENCHMARK_ALGORITHMS,
   convergence_plateau_iteration,
@@ -31,6 +33,7 @@ from optiflow.optimization.algorithms import (
   DecisionSpace,
   ObjectiveEvaluator,
   OptimizationControl,
+  aco,
   brute_force,
   brute_force_search_space_size,
   calculate_fitness,
@@ -745,6 +748,116 @@ class FitnessDisplayClippingTests(unittest.TestCase):
     text2 = format_progress_metrics_text(feasible_report)
     self.assertIn("F = 0.4200", text2)
     self.assertNotIn("ниж. предел", text2)
+
+
+class AcoInv3RegressionTests(unittest.TestCase):
+  """aco() crashed with 'probabilities are not non-negative' on large search
+  spaces (documented in the audit as an independent, pre-Inv_3 defect). Root
+  cause, confirmed by instrumenting pheromone/heuristic right before the crash:
+
+  1. aco()'s per-field heuristic probes a trial layout with ALL fields crammed
+     onto one screen, regardless of the actually configured N -- so its Inv_3
+     penalty triggers whenever num_fields > MILLER_HARD_LIMIT, making
+     scalar_fitness (and therefore that heuristic) negative. eta = heuristic**beta
+     does not preserve ranking once negatives are involved.
+  2. Ant System's pheromone deposit (pheromone[i, idx] += deposit_weight *
+     iteration_best) implicitly assumed iteration_best >= 0, which always held
+     before Inv_3's penalty existed. On a structurally Miller-infeasible space
+     (D > MILLER_HARD_LIMIT * N), EVERY iteration_best is negative, so every
+     deposit *subtracts*; after enough iterations pheromone itself goes
+     negative, and tau = pheromone**alpha then poisons the probability vector
+     with a negative entry that np.sum(probs) <= 0 does not catch (other
+     entries can keep the row sum positive).
+
+  So this was NOT an independent defect: it is a direct side effect of the
+  Inv_3 penalty landing on two places in aco() that implicitly assumed a
+  non-negative F. Both are fixed in algorithms.py without touching
+  compute_miller_penalty/ObjectiveEvaluator or the penalty's own tests.
+  """
+
+  def test_heuristic_probe_is_negative_for_d_over_hard_limit_confirming_diagnosis(self) -> None:
+    """Directly replicates aco()'s own single-screen trial-layout probe (before
+    any fix) to confirm the diagnosis: it goes negative purely because of
+    compute_miller_penalty, for a D that has nothing else pathological about it."""
+    fields = _mixed_fields_for_miller_tests(19, seed=1)  # D=19 > MILLER_HARD_LIMIT
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+    layout = build_interface_layout_from_partition(
+      fields,
+      [field.allowed_controls()[0] for field in fields],
+      [len(fields)],  # all fields crammed onto a single screen, exactly like aco()'s probe
+    )
+    self.assertLess(evaluator.scalar_fitness(layout), 0.0)
+
+  def test_rank_preserving_positive_heuristic_row_preserves_order(self) -> None:
+    from optiflow.optimization.algorithms import _rank_preserving_positive_heuristic_row
+
+    negative_row = np.array([-0.99, -0.5, -0.01])
+    rescaled = _rank_preserving_positive_heuristic_row(negative_row)
+    self.assertTrue((rescaled > 0.0).all())
+    self.assertTrue((np.argsort(negative_row) == np.argsort(rescaled)).all())
+
+  def test_rank_preserving_positive_heuristic_row_leaves_non_negative_rows_untouched(self) -> None:
+    from optiflow.optimization.algorithms import _rank_preserving_positive_heuristic_row
+
+    row = np.array([0.1, 0.9])
+    rescaled = _rank_preserving_positive_heuristic_row(row)
+    self.assertTrue(np.array_equal(row, rescaled))
+
+  def test_rank_preserving_positive_heuristic_row_handles_degenerate_tie(self) -> None:
+    from optiflow.optimization.algorithms import _rank_preserving_positive_heuristic_row
+
+    row = np.array([-0.4, -0.4])
+    rescaled = _rank_preserving_positive_heuristic_row(row)
+    self.assertTrue(np.isfinite(rescaled).all())
+    self.assertTrue((rescaled > 0.0).all())
+
+  def test_aco_does_not_crash_on_miller_infeasible_search_space(self) -> None:
+    """D=19, N=2: capacity 9*2=18 < 19 -- structurally Miller-infeasible, the
+    exact condition that used to crash aco() (reproduced at random_seed=5
+    with these parameters before the fix)."""
+    fields = _mixed_fields_for_miller_tests(19, seed=1)
+    space = DecisionSpace(fields, max_forms=2)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+
+    for seed in range(20):
+      with self.subTest(seed=seed):
+        result = aco(space, evaluator, ants=12, iterations=25, random_seed=seed)
+        layout = result["best_layout"]
+        self.assertIsNotNone(layout)
+        self.assertEqual(sum(len(f.elements) for f in layout.forms), 19)  # Inv_1 holds
+
+  def test_aco_full_suite_does_not_crash(self) -> None:
+    """Reproduces the exact scenario the crash was originally found in: the
+    full 10-algorithm ensemble, where ACO runs last with whatever global
+    random state the preceding nine algorithms left behind (runner.py never
+    seeds aco() explicitly)."""
+    fields = _mixed_fields_for_miller_tests(19, seed=1)
+    space = DecisionSpace(fields, max_forms=2)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+    payload = run_optimization_suite(space, evaluator, {})
+    self.assertIsNotNone(payload["results"]["ACO"]["best_layout"])
+
+  def test_aco_best_score_stays_raw_unclipped_when_miller_infeasible(self) -> None:
+    """The fix must not entangle with the display-only clipping from the
+    previous task: aco()'s own comparisons/selection (and its returned
+    best_score) must still use the raw, unclipped, potentially negative F.
+
+    D=30, N=2 (deficit=12, minimum achievable penalty 0.01*(6^2+6^2)=0.72) is
+    used rather than a near-boundary deficit: with only a 1-field deficit the
+    minimum penalty (0.01) is small enough that a high-E field mix can still
+    net a positive F, which would make this assertion depend on field
+    composition instead of on Inv_3 infeasibility itself.
+    """
+    fields = _mixed_fields_for_miller_tests(30, seed=1)
+    space = DecisionSpace(fields, max_forms=2)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+    result = aco(space, evaluator, ants=12, iterations=25, random_seed=5)
+    self.assertLess(result["best_score"], 0.0)
+    self.assertAlmostEqual(
+      result["best_score"],
+      evaluator.scalar_fitness(result["best_layout"]),
+      places=9,
+    )
 
 
 class MarkdownFormatTests(unittest.TestCase):

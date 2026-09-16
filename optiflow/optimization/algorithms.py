@@ -1464,6 +1464,24 @@ def tabu_search(
   }
 
 
+def _rank_preserving_positive_heuristic_row(row: np.ndarray) -> np.ndarray:
+  """Rescale one field's row of ACO heuristic values into a strictly positive,
+  order-preserving range, but only touch it when it actually contains a
+  negative value (see the call site in aco() for why: Inv_3's penalty can make
+  scalar_fitness negative for a single-screen trial layout with more than
+  MILLER_HARD_LIMIT fields, and eta = heuristic**beta does not preserve
+  ranking once negatives are involved). Rows that are already non-negative
+  (every case before that penalty existed, and every row where num_fields <=
+  MILLER_HARD_LIMIT) are returned unchanged.
+  """
+  if row.min() >= 0.0:
+    return row
+  span = row.max() - row.min()
+  if span <= 1e-12:
+    return np.ones_like(row)
+  return (row - row.min()) / span * (1.0 - 1e-6) + 1e-6
+
+
 def aco(
   space: DecisionSpace,
   evaluator: ObjectiveEvaluator,
@@ -1496,6 +1514,16 @@ def aco(
         space.counts_to_form_indices(counts),
       )
       heuristic[i, j] = evaluator.scalar_fitness(layout)
+
+  # This trial layout always crams every field onto a single screen (to probe
+  # "how good is this control for field i in isolation"), regardless of the
+  # actually configured max_forms -- so its Inv_3 penalty (compute_miller_penalty)
+  # triggers whenever num_fields > MILLER_HARD_LIMIT, independent of N. See
+  # _rank_preserving_positive_heuristic_row for why eta = heuristic**beta below
+  # needs this row rescaled before it is ever raised to a power.
+  for i in range(num_fields):
+    options = len(allowed[i])
+    heuristic[i, :options] = _rank_preserving_positive_heuristic_row(heuristic[i, :options])
 
   best_layout: Optional[InterfaceLayout] = None
   best_score = -1.0
@@ -1533,9 +1561,19 @@ def aco(
         iteration_best_layout = layout
     pheromone *= 1.0 - evaporation
     if iteration_best_layout is not None:
+      # Classic Ant System deposit (proportional to quality) implicitly assumes
+      # quality >= 0, which always held before Inv_3's penalty could make
+      # scalar_fitness negative (D > MILLER_HARD_LIMIT * N). Depositing a raw
+      # negative amount here compounds every iteration and eventually drives
+      # pheromone below zero, which then makes tau = pheromone**alpha negative
+      # and crashes np.random.choice ("probabilities are not non-negative").
+      # There is no "punish" mechanism in this update rule -- only "reinforce
+      # the iteration's best" -- so a bad iteration_best simply reinforces
+      # nothing (deposit 0) rather than corrupting the trail.
+      deposit = deposit_weight * max(0.0, iteration_best)
       for i, ctrl in enumerate(iteration_best_layout.controls_flat()):
         idx = allowed[i].index(ctrl)
-        pheromone[i, idx] += deposit_weight * iteration_best
+        pheromone[i, idx] += deposit
       if iteration_best > best_score:
         best_score = iteration_best
         best_layout = iteration_best_layout
