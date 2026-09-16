@@ -227,6 +227,27 @@ def calculate_fitness(
   )
 
 
+def clip_fitness_for_display(f: float) -> float:
+  """Clip F to [0, 1] for DISPLAY/EXPORT ONLY (GUI, reports, JSON).
+
+  F itself is intentionally unbounded below: Penalties has no upper bound, so
+  when Inv_3 is structurally unsatisfiable (D > MILLER_HARD_LIMIT * N, see
+  miller_feasibility_warning in corrections.py), F can go negative -- and it
+  must be allowed to, because that negative gradient is what lets a search
+  distinguish a less-bad solution from a worse one among layouts that are all
+  already infeasible (see MillerInfeasibilityTests). w1+w2+w3=1 and P,O,R are
+  each already clipped to [0,1], so F <= 1 always in practice; the upper clip
+  here is just an explicit invariant, not something the real formula can hit.
+
+  NEVER call this on the F used to compare or select solutions inside a
+  search (hill_climb/simulated_annealing/classic_genetic_algorithm/pso/
+  tabu_search/aco/greedy/random_search/brute_force/nsga2's Pareto-front pick)
+  -- only on a value already destined for a human or a JSON file, after every
+  internal comparison is done.
+  """
+  return max(0.0, min(1.0, float(f)))
+
+
 @dataclass(frozen=True)
 class ProgressReport:
   algorithm: str

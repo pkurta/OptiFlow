@@ -25,6 +25,7 @@ from optiflow.models.scoring import (
   FunctionRegistry,
   build_interface_layout_from_partition,
 )
+from optiflow.models.layout_io import interface_layout_to_payload
 from optiflow.optimization.algorithms import (
   CriterionWeights,
   DecisionSpace,
@@ -34,6 +35,7 @@ from optiflow.optimization.algorithms import (
   brute_force_search_space_size,
   calculate_fitness,
   classic_genetic_algorithm,
+  clip_fitness_for_display,
   compute_total_efficiency,
   nsga2,
   pso,
@@ -50,6 +52,7 @@ from optiflow.optimization.corrections import (
   miller_feasibility_warning,
 )
 from optiflow.optimization.runner import run_optimization_suite
+from optiflow.ui.run_results import build_algorithm_summaries
 
 
 def _mixed_fields_for_miller_tests(n: int, seed: int) -> List[FieldSpec]:
@@ -640,6 +643,82 @@ class MillerFeasibilityWarningTests(unittest.TestCase):
     self.assertIn("D=30", warning)  # Miller warning present
     self.assertIn("999999", warning)  # brute_force warning present too
     self.assertIsNone(payload["results"]["BruteForce"]["best_layout"])
+
+
+class FitnessDisplayClippingTests(unittest.TestCase):
+  """F, показываемый/экспортируемый пользователю (GUI, run_results.py, JSON),
+  должен лежать в [0,1] -- см. clip_fitness_for_display в algorithms.py. Внутренний
+  скаляр, которым все 10 алгоритмов сравнивают решения (ObjectiveEvaluator.
+  scalar_fitness и прямые вызовы calculate_fitness в algorithms.py), НЕ
+  клиппингуется и по-прежнему может уходить в отрицательную область при
+  структурно невыполнимом Inv_3 (D>9N) -- это подтверждают неизменные
+  RealisticMillerConvergenceTests и MillerInfeasibilityTests.
+  """
+
+  def test_clip_fitness_for_display_bounds(self) -> None:
+    self.assertEqual(clip_fitness_for_display(-0.72), 0.0)
+    self.assertEqual(clip_fitness_for_display(-1e-9), 0.0)
+    self.assertEqual(clip_fitness_for_display(1.5), 1.0)
+    self.assertEqual(clip_fitness_for_display(1.0 + 1e-9), 1.0)
+    for value in (0.0, 0.25, 0.5, 0.999, 1.0):
+      with self.subTest(value=value):
+        self.assertAlmostEqual(clip_fitness_for_display(value), value)
+
+  def test_build_algorithm_summaries_clips_fitness_but_keeps_raw_at_d_gt_9n(self) -> None:
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(30)]
+    ensure_allowed_controls(fields)
+    weights = CriterionWeights.balanced()
+    space = DecisionSpace(fields, max_forms=2)  # D=30 > MILLER_HARD_LIMIT*N=18
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
+    result = classic_genetic_algorithm(space, evaluator, pop_size=20, generations=15, random_seed=1)
+
+    summaries = build_algorithm_summaries({"GA": result}, FunctionRegistry(), weights)
+    ga_summary = next(s for s in summaries if s.key == "GA")
+
+    self.assertIsNotNone(ga_summary.layout)
+    self.assertLess(ga_summary.raw_fitness, 0.0, "D>9N: unclipped F should be negative here")
+    self.assertGreaterEqual(ga_summary.fitness, 0.0)
+    self.assertLessEqual(ga_summary.fitness, 1.0)
+    self.assertEqual(ga_summary.fitness, 0.0)  # raw < 0 -> clipped to the lower bound
+
+  def test_build_algorithm_summaries_raw_equals_fitness_when_feasible(self) -> None:
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(5)]
+    ensure_allowed_controls(fields)
+    weights = CriterionWeights.balanced()
+    space = DecisionSpace(fields, max_forms=2)  # D=5 <= 9*2, comfortably feasible
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
+    result = classic_genetic_algorithm(space, evaluator, pop_size=10, generations=10, random_seed=1)
+
+    summaries = build_algorithm_summaries({"GA": result}, FunctionRegistry(), weights)
+    ga_summary = next(s for s in summaries if s.key == "GA")
+
+    self.assertGreaterEqual(ga_summary.raw_fitness, 0.0)
+    # No clipping should occur when raw_fitness is already within [0, 1].
+    self.assertAlmostEqual(ga_summary.fitness, ga_summary.raw_fitness, places=9)
+
+  def test_interface_layout_payload_stores_both_fitness_fields(self) -> None:
+    layout = build_interface_layout_from_partition(
+      [FieldSpec("A", DataType.BOOLEAN, 1)], [ControlType.CHECKBOX], [1],
+    )
+    payload = interface_layout_to_payload(
+      layout, optiflow_version="test", fitness=0.0, raw_fitness=-0.72,
+    )
+    self.assertEqual(payload["metrics"]["fitness"], 0.0)
+    self.assertEqual(payload["metrics"]["raw_fitness"], -0.72)
+
+  def test_internal_comparison_path_is_never_clipped(self) -> None:
+    """Sanity guard for the exclusion in this task: ObjectiveEvaluator.scalar_fitness
+    -- the function every metaheuristic uses to compare/select solutions -- must still
+    be able to return a value outside [0,1]. If this assertion ever fails, clipping has
+    leaked into the internal search path, which would silently break the validated
+    property in RealisticMillerConvergenceTests/MillerInfeasibilityTests (that the
+    optimizer keeps a meaningful gradient among already-infeasible solutions)."""
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(30)]
+    ensure_allowed_controls(fields)
+    space = DecisionSpace(fields, max_forms=2)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+    layout = space.decode_layout(space.random_vector(), evaluator.registry)
+    self.assertLess(evaluator.scalar_fitness(layout), 0.0)
 
 
 class MarkdownFormatTests(unittest.TestCase):

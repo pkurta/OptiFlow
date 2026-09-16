@@ -4,7 +4,12 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from optiflow.models.scoring import EfficiencyTriple, FieldSpec, FunctionRegistry, InterfaceLayout
-from optiflow.optimization.algorithms import CriterionWeights, calculate_fitness, compute_total_efficiency
+from optiflow.optimization.algorithms import (
+  CriterionWeights,
+  calculate_fitness,
+  clip_fitness_for_display,
+  compute_total_efficiency,
+)
 from optiflow.optimization.corrections import DEFAULT_MILLER_PENALTY_WEIGHT, compute_miller_penalty
 from optiflow.optimization.runner import SUITE_STEPS
 
@@ -61,7 +66,8 @@ class AlgorithmRunSummary:
   label: str
   layout: Optional[InterfaceLayout]
   triple: Optional[EfficiencyTriple]
-  fitness: float
+  fitness: float  # clipped to [0, 1] for display/export -- see clip_fitness_for_display
+  raw_fitness: float  # unclipped F = w1*P+w2*O+w3*R-Penalties; can be negative when Inv_3 (D>9N) is unsatisfiable
   form_count: int
   history_steps: int
   algo_best_score: float
@@ -138,6 +144,7 @@ def build_algorithm_summaries(
           layout=None,
           triple=None,
           fitness=0.0,
+          raw_fitness=0.0,
           form_count=0,
           history_steps=0,
           algo_best_score=0.0,
@@ -156,11 +163,13 @@ def build_algorithm_summaries(
     elapsed_s = float(elapsed_raw) if elapsed_raw is not None else None
     triple: Optional[EfficiencyTriple] = None
     fitness = 0.0
+    raw_fitness = 0.0
     form_count = 0
     if layout is not None:
       triple = compute_total_efficiency(layout, registry)
       penalties = compute_miller_penalty(layout, penalty_weight)
-      fitness = calculate_fitness(triple, weights, penalties=penalties)
+      raw_fitness = calculate_fitness(triple, weights, penalties=penalties)
+      fitness = clip_fitness_for_display(raw_fitness)
       form_count = layout.form_count
     summaries.append(
       AlgorithmRunSummary(
@@ -169,6 +178,7 @@ def build_algorithm_summaries(
         layout=layout,
         triple=triple,
         fitness=fitness,
+        raw_fitness=raw_fitness,
         form_count=form_count,
         history_steps=history_steps,
         algo_best_score=algo_best,
@@ -234,8 +244,15 @@ def format_optimization_report(
   lines.extend(_plain_scoring_explanation(field_count=field_count, max_forms=max_forms, weights=weights))
 
   by_key = summaries_by_key(summaries)
-  best_fitness = max(
-    (item.fitness for item in summaries if item.layout is not None),
+  # Ranking/comparison math below uses raw_fitness (unclipped), not the
+  # displayed fitness (clipped to [0,1] -- see clip_fitness_for_display):
+  # when Inv_3 is structurally unfeasible (D>9N) several algorithms can all
+  # display F=0, and ranking by the clipped value would make them look tied
+  # even though one genuinely violates the cognitive-load limit less than
+  # another. best_raw_fitness is only used for internal ordering here; the
+  # printed "F = ..." text always shows the clipped, in-range value.
+  best_raw_fitness = max(
+    (item.raw_fitness for item in summaries if item.layout is not None),
     default=0.0,
   )
 
@@ -259,9 +276,12 @@ def format_optimization_report(
         lines.append(f"  Шагов в истории: {item.history_steps}")
       continue
     assert item.triple is not None
+    f_line = f"  F = {item.fitness:.4f}"
+    if item.raw_fitness < item.fitness - 1e-9:
+      f_line += f" (нижний предел; реальный F без клиппинга = {item.raw_fitness:.4f})"
     lines.extend(
       [
-        f"  F = {item.fitness:.4f}  |  P = {item.triple.potency:.4f}  |  "
+        f"{f_line}  |  P = {item.triple.potency:.4f}  |  "
         f"O = {item.triple.operativeness:.4f}  |  R = {item.triple.resource_saving:.4f}",
         f"  Экранов мастера: {item.form_count}  |  Шагов истории: {item.history_steps}",
         f"  Контролы: {', '.join(c.name for c in item.layout.controls_flat())}",
@@ -269,27 +289,30 @@ def format_optimization_report(
         describe_solution_layout(item.layout),
       ]
     )
-    if best_fitness > 0:
-      if item.fitness >= best_fitness - 1e-9:
+    if best_raw_fitness > 0:
+      if item.raw_fitness >= best_raw_fitness - 1e-9:
         lines.append("  Сравнение: лидер по F среди успешных алгоритмов.")
       else:
-        pct = item.fitness / best_fitness * 100.0
-        lines.append(f"  Сравнение: {pct:.1f}% от лучшего F ({best_fitness:.4f}).")
+        pct = item.raw_fitness / best_raw_fitness * 100.0
+        lines.append(f"  Сравнение: {pct:.1f}% от лучшего F ({best_raw_fitness:.4f}, без клиппинга).")
 
   ranked = sorted(
     [item for item in summaries if item.ran and item.layout is not None],
-    key=lambda x: x.fitness,
+    key=lambda x: x.raw_fitness,
     reverse=True,
   )
   if ranked:
     leader = ranked[0]
+    leader_line = f"  Лучший F: {leader.label} — F={leader.fitness:.4f}"
+    if leader.raw_fitness < leader.fitness - 1e-9:
+      leader_line += f" (нижний предел; реальный F без клиппинга = {leader.raw_fitness:.4f})"
+    leader_line += f", время {_format_duration(leader.elapsed_s)}, экранов={leader.form_count}."
     lines.extend(
       [
         "",
         "Итог",
         "=" * 52,
-        f"  Лучший F: {leader.label} — F={leader.fitness:.4f}, "
-        f"время {_format_duration(leader.elapsed_s)}, экранов={leader.form_count}.",
+        leader_line,
         "  Подробная визуализация — вкладка «Визуализация», интерпретация — «Интерпретация».",
       ]
     )

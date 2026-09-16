@@ -89,10 +89,15 @@ def _build_algorithm_search_blocks(summaries: Sequence[AlgorithmRunSummary]) -> 
       block.append("Итоговый layout: не получен.")
     else:
       assert item.triple is not None
+      fitness_note = (
+        f" (нижний предел отображения; реальный F без клиппинга = {item.raw_fitness:.4f})"
+        if item.raw_fitness < item.fitness - 1e-9
+        else ""
+      )
       block.extend(
         [
           (
-            f"Итоговые метрики layout: F={item.fitness:.4f}, "
+            f"Итоговые метрики layout: F={item.fitness:.4f}{fitness_note}, "
             f"P={item.triple.potency:.4f}, O={item.triple.operativeness:.4f}, "
             f"R={item.triple.resource_saving:.4f}"
           ),
@@ -130,8 +135,13 @@ def build_interpretation_prompt(
   if ranked:
     leader = ranked[0]
     assert leader.layout is not None and leader.triple is not None
+    leader_fitness_note = (
+      f" (нижний предел отображения; реальный F без клиппинга = {leader.raw_fitness:.4f})"
+      if leader.raw_fitness < leader.fitness - 1e-9
+      else ""
+    )
     leader_block = (
-      f"Лидер по F: {leader.label} [{leader.key}] — F={leader.fitness:.4f}, "
+      f"Лидер по F: {leader.label} [{leader.key}] — F={leader.fitness:.4f}{leader_fitness_note}, "
       f"время {_format_duration(leader.elapsed_s)}, экранов={leader.form_count}."
     )
 

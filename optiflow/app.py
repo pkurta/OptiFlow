@@ -38,6 +38,7 @@ from optiflow.optimization.algorithms import (
   brute_force,
   calculate_fitness,
   classic_genetic_algorithm,
+  clip_fitness_for_display,
   compute_total_efficiency,
   greedy,
   hill_climb,
@@ -1526,7 +1527,7 @@ if _HAS_PYQT5:
     def show_results(self, summaries: List[AlgorithmRunSummary]) -> None:
       self._suite_summaries = sorted(
         summaries_with_layouts(summaries),
-        key=lambda item: item.fitness,
+        key=lambda item: item.raw_fitness,  # unclipped -- see clip_fitness_for_display
         reverse=True,
       )
       select_key = self._suite_summaries[0].key if self._suite_summaries else None
@@ -1885,8 +1886,12 @@ if _HAS_PYQT5:
       self.charts_tab.plot_histories(histories_from_results(results))
       result_rows: List[Tuple[str, Optional[EfficiencyTriple], float, int]] = []
       for item in sorted(
+        # Rank by raw_fitness (unclipped), not the displayed fitness: at
+        # D>9N several algorithms can all display F=0 (see
+        # clip_fitness_for_display), and ranking by that would make them
+        # look tied even though one violates Inv_3 less than another.
         summaries,
-        key=lambda s: (s.fitness if s.layout is not None else -1.0),
+        key=lambda s: (s.raw_fitness if s.layout is not None else -1.0),
         reverse=True,
       ):
         if item.layout is None:
@@ -1985,6 +1990,7 @@ if _HAS_PYQT5:
           operativeness=None if triple is None else triple.operativeness,
           resource_saving=None if triple is None else triple.resource_saving,
           fitness=None if item is None else item.fitness,
+          raw_fitness=None if item is None else item.raw_fitness,
         )
         with open(path, "w", encoding="utf-8") as fh:
           json.dump(payload, fh, ensure_ascii=False, indent=2)
@@ -2038,7 +2044,8 @@ if _HAS_PYQT5:
         self.weights = self.data_tab.coef.weights()
       _ensure_allowed_controls(layout.fields)
       triple = compute_total_efficiency(layout, self.registry)
-      fitness = calculate_fitness(triple, self.weights, penalties=compute_miller_penalty(layout))
+      raw_fitness = calculate_fitness(triple, self.weights, penalties=compute_miller_penalty(layout))
+      fitness = clip_fitness_for_display(raw_fitness)
       source_name = Path(path).name
       summary = AlgorithmRunSummary(
         key=LOADED_LAYOUT_KEY,
@@ -2046,9 +2053,10 @@ if _HAS_PYQT5:
         layout=layout,
         triple=triple,
         fitness=fitness,
+        raw_fitness=raw_fitness,
         form_count=layout.form_count,
         history_steps=0,
-        algo_best_score=fitness,
+        algo_best_score=raw_fitness,
         elapsed_s=None,
         ran=True,
       )
@@ -2222,8 +2230,14 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
 
   assert best_layout is not None and best_triple is not None
   w1, w2, w3 = weights.display_parts(digits=2)
+  displayed_fitness = clip_fitness_for_display(best_fitness)
+  fitness_note = (
+    f" (нижний предел; реальный F без клиппинга = {best_fitness:.4f})"
+    if best_fitness < displayed_fitness - 1e-9
+    else ""
+  )
   print(
-    f"[{best_name}] F={best_fitness:.4f} "
+    f"[{best_name}] F={displayed_fitness:.4f}{fitness_note} "
     f"P={best_triple.potency:.3f} O={best_triple.operativeness:.3f} R={best_triple.resource_saving:.3f} "
     f"weights=({w1},{w2},{w3}) forms={best_layout.form_count}"
   )

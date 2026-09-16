@@ -61,6 +61,7 @@ def interface_layout_to_payload(
   operativeness: Optional[float] = None,
   resource_saving: Optional[float] = None,
   fitness: Optional[float] = None,
+  raw_fitness: Optional[float] = None,
 ) -> Dict[str, Any]:
   payload: Dict[str, Any] = {
     "format": INTERFACE_LAYOUT_FORMAT,
@@ -93,12 +94,20 @@ def interface_layout_to_payload(
       "operativeness": float(weights[1]),
       "resource_saving": float(weights[2]),
     }
-  if any(value is not None for value in (potency, operativeness, resource_saving, fitness)):
+  if any(
+    value is not None
+    for value in (potency, operativeness, resource_saving, fitness, raw_fitness)
+  ):
     payload["metrics"] = {
       "potency": potency,
       "operativeness": operativeness,
       "resource_saving": resource_saving,
+      # "fitness" is clipped to [0, 1] for display (see clip_fitness_for_display
+      # in optiflow/optimization/algorithms.py); "raw_fitness" is the unclipped
+      # scalar and can be negative when Inv_3 is structurally unsatisfiable
+      # (D > MILLER_HARD_LIMIT * N -- see miller_feasibility_warning).
       "fitness": fitness,
+      "raw_fitness": raw_fitness,
     }
   return payload
 
