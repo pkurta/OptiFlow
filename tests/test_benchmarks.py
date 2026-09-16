@@ -45,7 +45,11 @@ from optiflow.optimization.corrections import (
   DEFAULT_MILLER_PENALTY_WEIGHT,
   MILLER_HARD_LIMIT,
   compute_miller_penalty,
+  is_miller_feasible,
+  miller_feasibility_margin,
+  miller_feasibility_warning,
 )
+from optiflow.optimization.runner import run_optimization_suite
 
 
 def _mixed_fields_for_miller_tests(n: int, seed: int) -> List[FieldSpec]:
@@ -479,15 +483,17 @@ class MillerInfeasibilityTests(unittest.TestCase):
   _D = 30
   _N = 2  # capacity = MILLER_HARD_LIMIT * N = 18 < 30 -> Inv_3 unsatisfiable by construction
 
-  def test_decision_space_accepts_infeasible_d_n_without_any_guard(self) -> None:
-    """Фиксирует ТЕКУЩЕЕ поведение: ни DecisionSpace, ни его конструктор не
-    проверяют D <= MILLER_HARD_LIMIT * max_forms. Это не баг сам по себе -- но
-    кандидат на доработку (предупреждение в GUI "Inv_3 недостижим при данных
-    D и N"), которая явно НЕ входит в объём этой задачи."""
+  def test_decision_space_construction_never_raises_but_warns(self) -> None:
+    """DecisionSpace(fields, max_forms) сам по себе не проверяет и не блокирует
+    D > MILLER_HARD_LIMIT * max_forms (конструктор не бросает исключений --
+    синтез остаётся запускаемым), но теперь предоставляет space.miller_warning()
+    для информирования пользователя до запуска (см. MillerFeasibilityWarningTests
+    и run_optimization_suite в optiflow/optimization/runner.py)."""
     self.assertGreater(self._D, MILLER_HARD_LIMIT * self._N, "фикстура должна быть заведомо неразрешимой")
     fields = _mixed_fields_for_miller_tests(self._D, seed=2)
-    space = DecisionSpace(fields, max_forms=self._N)  # no exception, no warning surface
+    space = DecisionSpace(fields, max_forms=self._N)  # no exception
     self.assertEqual(space.control_dim(), self._D)
+    self.assertIsNotNone(space.miller_warning())
 
   def test_infeasible_space_degrades_predictably_not_crashes(self) -> None:
     """Inv_1 (полнота полей) остаётся обеспечен репарацией декодера, penalty
@@ -529,6 +535,111 @@ class MillerInfeasibilityTests(unittest.TestCase):
     # Balanced optimum for D=30, N=2 is exactly [15, 15]; allow a small margin
     # for GA's stochastic search instead of requiring the exact optimum.
     self.assertLessEqual(max(sizes) - min(sizes), 4)
+
+
+class MillerFeasibilityWarningTests(unittest.TestCase):
+  """D > MILLER_HARD_LIMIT * N теперь детектируется и явно сообщается пользователю
+  (см. is_miller_feasible/miller_feasibility_margin/miller_feasibility_warning в
+  optiflow/optimization/corrections.py, DecisionSpace.miller_warning в algorithms.py,
+  и run_optimization_suite в optiflow/optimization/runner.py) -- по тому же принципу
+  "предупреждать, не блокировать", что и |Ω| > BRUTE_FORCE_MAX_COMBINATIONS.
+  """
+
+  def test_is_miller_feasible_boundary_is_inclusive(self) -> None:
+    # D == hard_limit * N is exactly satisfiable (each form gets exactly hard_limit).
+    self.assertTrue(is_miller_feasible(9, 1))
+    self.assertTrue(is_miller_feasible(18, 2))
+    self.assertTrue(is_miller_feasible(27, 3))
+    # One field over the boundary tips it into infeasible.
+    self.assertFalse(is_miller_feasible(10, 1))
+    self.assertFalse(is_miller_feasible(19, 2))
+    # Comfortable margin on both sides.
+    self.assertTrue(is_miller_feasible(5, 1))
+    self.assertFalse(is_miller_feasible(100, 2))
+
+  def test_feasibility_margin_sign_and_magnitude(self) -> None:
+    self.assertEqual(miller_feasibility_margin(18, 2), 0)  # exact boundary, no slack
+    self.assertEqual(miller_feasibility_margin(16, 2), 2)  # 2 fields of headroom
+    self.assertEqual(miller_feasibility_margin(30, 2), -12)  # 12-field deficit
+
+  def test_warning_is_none_when_feasible(self) -> None:
+    for d, n in ((9, 1), (18, 2), (5, 3), (1, 1)):
+      with self.subTest(d=d, n=n):
+        self.assertIsNone(miller_feasibility_warning(d, n))
+
+  def test_warning_carries_concrete_numbers_when_infeasible(self) -> None:
+    message = miller_feasibility_warning(30, 2)
+    self.assertIsNotNone(message)
+    # Concrete numbers must be present, not just a generic sentence: D, N,
+    # total capacity (hard_limit*N), and the minimum N needed (ceil(D/hard_limit)).
+    self.assertIn("D=30", message)
+    self.assertIn("N=2", message)
+    self.assertIn("18", message)  # capacity = 9*2
+    self.assertIn("4", message)  # ceil(30/9) forms needed
+
+  def test_decision_space_miller_warning_matches_module_function(self) -> None:
+    fields = _mixed_fields_for_miller_tests(30, seed=2)
+    space = DecisionSpace(fields, max_forms=2)
+    self.assertEqual(space.miller_warning(), miller_feasibility_warning(30, 2))
+
+    feasible_fields = _mixed_fields_for_miller_tests(16, seed=2)
+    feasible_space = DecisionSpace(feasible_fields, max_forms=2)
+    self.assertIsNone(feasible_space.miller_warning())
+
+  def test_run_optimization_suite_surfaces_warning_when_infeasible(self) -> None:
+    """Тот же путь, что использует GUI (MainWindow.run_algorithms -> OptimizationWorker
+    -> run_optimization_suite -> data["warning"] -> QMessageBox.warning), и headless
+    (run_headless_cli печатает то же значение). D=30 полей, все BOOLEAN (единственный
+    допустимый control на поле) -- сознательно, чтобы не задевать несвязанный численный
+    edge-case в aco() на больших пространствах с TEXT/UNSIGNED полями."""
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(30)]
+    ensure_allowed_controls(fields)
+    space = DecisionSpace(fields, max_forms=2)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+
+    payload = run_optimization_suite(space, evaluator, {})
+
+    self.assertIsNotNone(payload["warning"])
+    self.assertIn("D=30", str(payload["warning"]))
+    self.assertIn("N=2", str(payload["warning"]))
+    # Not blocked: every algorithm in the suite still produced a result.
+    self.assertEqual(len(payload["results"]), 10)
+    for key, result in payload["results"].items():
+      with self.subTest(algorithm=key):
+        self.assertIsNotNone(result.get("best_layout"), f"{key} produced no layout")
+
+  def test_run_optimization_suite_has_no_warning_when_feasible(self) -> None:
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(10)]
+    ensure_allowed_controls(fields)
+    space = DecisionSpace(fields, max_forms=2)  # capacity 18 >= 10
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+
+    payload = run_optimization_suite(space, evaluator, {})
+
+    self.assertIsNone(payload["warning"])
+
+  def test_miller_and_brute_force_warnings_combine_without_clobbering(self) -> None:
+    """Оба предупреждения используют одно и то же поле warning/виджет -- если
+    триггерятся оба условия (Inv_3 недостижим И |Ω| > BRUTE_FORCE_MAX_COMBINATIONS),
+    ни одно не должно "потеряться". brute_force замокан, чтобы не зависеть от
+    конкретного числа комбинаций и не задевать несвязанный edge-case в aco()."""
+    from unittest.mock import patch
+
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(30)]
+    ensure_allowed_controls(fields)
+    space = DecisionSpace(fields, max_forms=2)  # Miller-infeasible: 30 > 9*2
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), CriterionWeights.balanced())
+
+    with patch(
+      "optiflow.optimization.runner.brute_force",
+      side_effect=ValueError("Brute force search space (999999 combinations) exceeds limit"),
+    ):
+      payload = run_optimization_suite(space, evaluator, {})
+
+    warning = str(payload["warning"])
+    self.assertIn("D=30", warning)  # Miller warning present
+    self.assertIn("999999", warning)  # brute_force warning present too
+    self.assertIsNone(payload["results"]["BruteForce"]["best_layout"])
 
 
 class MarkdownFormatTests(unittest.TestCase):

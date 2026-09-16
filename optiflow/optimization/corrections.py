@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+from typing import Optional
+
 from optiflow.models.scoring import EfficiencyTriple, InterfaceLayout
 
 # Inv_3 (когнитивный предел Миллера): "∑ c_elem ≤ 7 ± 2" — мягкая граница 5 из
@@ -11,6 +14,46 @@ MILLER_HARD_LIMIT = MILLER_SOFT_LIMIT + MILLER_TOLERANCE  # 9
 
 # Штраф за 1 «лишний» элемент на экране, при excess=1 (k_i=10).
 DEFAULT_MILLER_PENALTY_WEIGHT = 0.01
+
+
+def is_miller_feasible(d: int, n: int, hard_limit: int = MILLER_HARD_LIMIT) -> bool:
+  """True, если суммарная ёмкость N экранов (hard_limit * N) вмещает D полей.
+
+  Граница включительна: D == hard_limit * N считается допустимым (существует
+  разбиение, где каждый экран получает ровно hard_limit полей).
+  """
+  return int(d) <= int(hard_limit) * int(n)
+
+
+def miller_feasibility_margin(d: int, n: int, hard_limit: int = MILLER_HARD_LIMIT) -> int:
+  """hard_limit*N - D: запас ёмкости. Отрицательное значение — дефицит полей,
+  на который суммарная ёмкость экранов меньше D (Inv_3 структурно невыполним)."""
+  return int(hard_limit) * int(n) - int(d)
+
+
+def miller_feasibility_warning(
+  d: int,
+  n: int,
+  hard_limit: int = MILLER_HARD_LIMIT,
+) -> Optional[str]:
+  """None, если Inv_3 выполним при данных (D, N); иначе — готовый текст
+  предупреждения с конкретными числами, для GUI и headless-путей.
+
+  Не блокирует синтез: возвращаемая строка предназначена для показа
+  предупреждением (как переполнение |Ω| у brute_force), а не для исключения —
+  штраф compute_miller_penalty всё равно минимизирует превышение, только не
+  может свести его к нулю при D > hard_limit * N.
+  """
+  if is_miller_feasible(d, n, hard_limit):
+    return None
+  capacity = int(hard_limit) * int(n)
+  min_forms_needed = math.ceil(d / hard_limit) if hard_limit > 0 else d
+  return (
+    f"При D={d} полях и N={n} экранах предел Миллера (k_i<={hard_limit}) структурно "
+    f"недостижим: суммарная ёмкость экранов {capacity} < D={d}. Требуется минимум "
+    f"{min_forms_needed} экранов, чтобы Inv_3 стал выполним; штраф всё равно "
+    f"минимизирует превышение ёмкости, но не может свести его к нулю."
+  )
 
 
 def compute_miller_penalty(

@@ -27,6 +27,7 @@ from optiflow.optimization.corrections import (
   apply_element_position_correction,
   apply_form_step_correction,
   compute_miller_penalty,
+  miller_feasibility_warning,
 )
 
 
@@ -485,6 +486,13 @@ class DecisionSpace:
 
   def dimension(self) -> int:
     return self.control_dim() + self.partition_dim()
+
+  def miller_warning(self) -> Optional[str]:
+    """None when Inv_3 is structurally satisfiable for this space; otherwise a
+    ready-to-show warning (see miller_feasibility_warning in corrections.py).
+    Informational only -- does not affect decode_layout or the penalty itself.
+    """
+    return miller_feasibility_warning(self.control_dim(), self.partition_dim())
 
   def cardinalities(self) -> List[int]:
     return [len(f.allowed_controls()) for f in self.fields]

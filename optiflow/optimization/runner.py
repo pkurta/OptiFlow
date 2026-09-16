@@ -41,7 +41,11 @@ def run_optimization_suite(
 ) -> Dict[str, object]:
   """Run the full algorithm suite. Safe to call from a worker thread."""
   results: Dict[str, Dict[str, object]] = {}
-  warning: Optional[str] = None
+  # Inv_3 (Miller) feasibility is known before any algorithm runs -- surface it
+  # through the same "warning" field/QMessageBox as the |Ω| > BRUTE_FORCE_MAX_COMBINATIONS
+  # case below, rather than a separate UX path. Purely informational: it does not
+  # stop the suite from running.
+  warning: Optional[str] = space.miller_warning()
   cancelled = False
   total = len(SUITE_STEPS)
   suite_started = time.perf_counter()
@@ -75,7 +79,8 @@ def run_optimization_suite(
         results[key] = brute_force(space, evaluator, control=control)
       except ValueError as exc:
         results[key] = {"best_score": 0.0, "history": [], "best_layout": None}
-        warning = str(exc)
+        bf_warning = str(exc)
+        warning = f"{warning}\n\n{bf_warning}" if warning else bf_warning
     elif key == "GA":
       results[key] = classic_genetic_algorithm(
         space,

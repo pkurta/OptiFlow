@@ -1925,7 +1925,10 @@ if _HAS_PYQT5:
       self.overlay.stop()
       self.alg_tab.set_run_enabled(True)
       if warning:
-        QtWidgets.QMessageBox.warning(self, "Полный перебор (Brute Force)", str(warning))
+        # Same field/widget carries both the Inv_3 (Miller) feasibility warning,
+        # computed before any algorithm runs, and the brute-force |Ω| overflow
+        # warning -- title generalized since it's no longer brute-force-specific.
+        QtWidgets.QMessageBox.warning(self, "Предупреждение", str(warning))
       if cancelled:
         QtWidgets.QMessageBox.information(
           self,
@@ -2158,6 +2161,10 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
   weights = CriterionWeights.from_raw(*WEIGHT_PRESETS["Упор на оперативность"])
   space = DecisionSpace(fields, max_forms=max_forms)
   evaluator = ObjectiveEvaluator(registry, weights)
+
+  miller_warning = space.miller_warning()
+  if miller_warning:
+    print(f"[warning] {miller_warning}")
 
   algorithm_runs: List[Tuple[str, Dict[str, object]]] = [
     ("NSGA-II", nsga2(space, evaluator, pop_size=30, generations=25, random_seed=42)),
