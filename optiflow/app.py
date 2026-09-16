@@ -193,6 +193,26 @@ PROBLEM_DATA_FORMAT = "optiflow-problem-data"
 PROBLEM_DATA_VERSION = 1
 
 
+def format_progress_metrics_text(report: ProgressReport) -> str:
+  """Live "F = ..." line for ProgressOverlay -- clipped for display, like every
+  other user-facing F (see clip_fitness_for_display). report.best_fitness itself
+  stays unclipped internally (ProgressReport is fed straight from each
+  algorithm's own search loop) and can be negative when Inv_3 is structurally
+  unsatisfiable (D > MILLER_HARD_LIMIT * N)."""
+  displayed_fitness = clip_fitness_for_display(report.best_fitness)
+  fitness_note = (
+    f" (ниж. предел; реальный F = {report.best_fitness:.4f})"
+    if report.best_fitness < displayed_fitness - 1e-9
+    else ""
+  )
+  return (
+    f"F = {displayed_fitness:.4f}{fitness_note}    "
+    f"P = {report.potency:.3f}    "
+    f"O = {report.operativeness:.3f}    "
+    f"R = {report.resource_saving:.3f}"
+  )
+
+
 if _HAS_PYQT5:
 
   class _CommitSlider(QtWidgets.QSlider):
@@ -1211,12 +1231,7 @@ if _HAS_PYQT5:
         f"Алгоритм {report.algorithm_index + 1} из {report.algorithm_count}"
       )
       self.bar.setValue(int(round(report.overall_fraction * 1000)))
-      self.metrics_label.setText(
-        f"F = {report.best_fitness:.4f}    "
-        f"P = {report.potency:.3f}    "
-        f"O = {report.operativeness:.3f}    "
-        f"R = {report.resource_saving:.3f}"
-      )
+      self.metrics_label.setText(format_progress_metrics_text(report))
 
     def _refresh_elapsed(self) -> None:
       ms = self._elapsed.elapsed() if self._elapsed.isValid() else 0

@@ -720,6 +720,32 @@ class FitnessDisplayClippingTests(unittest.TestCase):
     layout = space.decode_layout(space.random_vector(), evaluator.registry)
     self.assertLess(evaluator.scalar_fitness(layout), 0.0)
 
+  def test_progress_overlay_metrics_text_is_clipped_with_raw_annotation(self) -> None:
+    """ProgressOverlay.apply_report (live "F = ..." during a run) was missed in the
+    first clipping pass -- it reads ProgressReport.best_fitness directly, bypassing
+    AlgorithmRunSummary entirely. format_progress_metrics_text is the pure function
+    it now delegates to, importable without a QApplication."""
+    from optiflow.app import format_progress_metrics_text
+    from optiflow.optimization.algorithms import ProgressReport
+
+    infeasible_report = ProgressReport(
+      algorithm="GA", algorithm_index=0, algorithm_count=1,
+      iteration=1, max_iterations=10, best_fitness=-0.72,
+      potency=0.5, operativeness=0.5, resource_saving=0.5, overall_fraction=0.1,
+    )
+    text = format_progress_metrics_text(infeasible_report)
+    self.assertIn("F = 0.0000", text)
+    self.assertIn("-0.7200", text)
+
+    feasible_report = ProgressReport(
+      algorithm="GA", algorithm_index=0, algorithm_count=1,
+      iteration=1, max_iterations=10, best_fitness=0.42,
+      potency=0.5, operativeness=0.5, resource_saving=0.5, overall_fraction=0.1,
+    )
+    text2 = format_progress_metrics_text(feasible_report)
+    self.assertIn("F = 0.4200", text2)
+    self.assertNotIn("ниж. предел", text2)
+
 
 class MarkdownFormatTests(unittest.TestCase):
   def test_format_benchmark_markdown_table(self) -> None:
