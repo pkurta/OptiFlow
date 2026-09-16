@@ -14,7 +14,14 @@ from optiflow.benchmarks import (
   random_benchmark_snapshot,
   run_optimization_benchmark,
 )
-from optiflow.models.scoring import DataType, EfficiencyTriple, FieldSpec, FunctionRegistry
+from optiflow.models.scoring import (
+  ControlType,
+  DataType,
+  EfficiencyTriple,
+  FieldSpec,
+  FunctionRegistry,
+  build_interface_layout_from_partition,
+)
 from optiflow.optimization.algorithms import (
   CriterionWeights,
   DecisionSpace,
@@ -25,8 +32,13 @@ from optiflow.optimization.algorithms import (
   calculate_fitness,
   classic_genetic_algorithm,
   compute_total_efficiency,
+  nsga2,
   random_search,
   redistribute_weight_ticks,
+)
+from optiflow.optimization.corrections import (
+  MILLER_HARD_LIMIT,
+  compute_miller_penalty,
 )
 
 
@@ -258,6 +270,97 @@ class MonteCarloBenchmarkTests(unittest.TestCase):
     bf = brute_force(space, evaluator)
     ga = classic_genetic_algorithm(space, evaluator, pop_size=10, generations=15, random_seed=1)
     self.assertGreaterEqual(float(bf["best_score"]), float(ga["best_score"]) - 1e-9)
+
+
+class MillerConstraintTests(unittest.TestCase):
+  """Inv_3 (Miller 7±2): ∑ c_elem <= 9 enforced as a penalty in F."""
+
+  def _layout_with_form_sizes(self, sizes: list[int]):
+    total = sum(sizes)
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(total)]
+    ensure_allowed_controls(fields)
+    controls = [ControlType.CHECKBOX] * total
+    return build_interface_layout_from_partition(fields, controls, sizes)
+
+  def test_penalty_zero_at_and_below_hard_limit(self) -> None:
+    self.assertEqual(MILLER_HARD_LIMIT, 9)
+    layout = self._layout_with_form_sizes([MILLER_HARD_LIMIT])
+    self.assertEqual(compute_miller_penalty(layout), 0.0)
+    small_layout = self._layout_with_form_sizes([3, 2])
+    self.assertEqual(compute_miller_penalty(small_layout), 0.0)
+
+  def test_penalty_grows_quadratically_beyond_hard_limit(self) -> None:
+    layout_10 = self._layout_with_form_sizes([10])  # excess = 1
+    layout_12 = self._layout_with_form_sizes([12])  # excess = 3
+    penalty_10 = compute_miller_penalty(layout_10, penalty_weight=1.0)
+    penalty_12 = compute_miller_penalty(layout_12, penalty_weight=1.0)
+    self.assertAlmostEqual(penalty_10, 1.0)   # 1**2
+    self.assertAlmostEqual(penalty_12, 9.0)   # 3**2
+    self.assertGreater(penalty_12, penalty_10)
+    # Quadratic, not linear: penalty ratio (9x) outpaces excess ratio (3x).
+    self.assertAlmostEqual(penalty_12 / penalty_10, 9.0)
+
+  def test_multiple_forms_sum_independently(self) -> None:
+    layout = self._layout_with_form_sizes([10, 11, 5])  # excess 1 and 2, one compliant
+    penalty = compute_miller_penalty(layout, penalty_weight=1.0)
+    self.assertAlmostEqual(penalty, 1.0 + 4.0)
+
+  def test_violating_layout_scores_lower_fitness_for_equal_efficiency(self) -> None:
+    """Same underlying E = (P, O, R), worse Inv_3 distribution -> lower F."""
+    from unittest.mock import patch
+
+    weights = CriterionWeights.balanced()
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
+    compliant_layout = self._layout_with_form_sizes([5, 4])
+    violating_layout = self._layout_with_form_sizes([10, 9])
+    fixed_triple = EfficiencyTriple(0.8, 0.8, 0.8)
+
+    with patch(
+      "optiflow.optimization.algorithms.compute_total_efficiency",
+      return_value=fixed_triple,
+    ):
+      compliant_score = evaluator.scalar_fitness(compliant_layout)
+      violating_score = evaluator.scalar_fitness(violating_layout)
+
+    self.assertLess(violating_score, compliant_score)
+    self.assertAlmostEqual(
+      compliant_score,
+      calculate_fitness(fixed_triple, weights, penalties=0.0),
+    )
+
+  def test_scalar_fitness_matches_manual_penalized_formula(self) -> None:
+    fields = [FieldSpec(f"F{i}", DataType.UNSIGNED, 2) for i in range(11)]
+    ensure_allowed_controls(fields)
+    weights = CriterionWeights.from_raw(0.4, 0.3, 0.3)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
+    space = DecisionSpace(fields, max_forms=1)  # forces k=11 > hard limit
+    layout = space.decode_layout(space.random_vector(), evaluator.registry)
+    triple = compute_total_efficiency(layout, evaluator.registry)
+    penalty = compute_miller_penalty(layout, evaluator.penalty_weight)
+    self.assertGreater(penalty, 0.0)
+    expected = calculate_fitness(triple, weights, penalties=penalty)
+    self.assertAlmostEqual(evaluator.scalar_fitness(layout), expected, places=9)
+
+  def test_brute_force_and_nsga2_apply_same_penalty_as_scalar_fitness(self) -> None:
+    fields = [FieldSpec(f"F{i}", DataType.BOOLEAN, 1) for i in range(10)]
+    ensure_allowed_controls(fields)
+    weights = CriterionWeights.balanced()
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
+    space = DecisionSpace(fields, max_forms=1)  # single form, k=10 always > hard limit
+
+    bf = brute_force(space, evaluator)
+    bf_layout = bf["best_layout"]
+    self.assertEqual(len(bf_layout.forms[0].elements), 10)
+    self.assertAlmostEqual(float(bf["best_score"]), evaluator.scalar_fitness(bf_layout), places=9)
+
+    result = nsga2(space, evaluator, pop_size=10, generations=5, random_seed=1)
+    n_layout = result["best_layout"]
+    self.assertIsNotNone(n_layout)
+    self.assertAlmostEqual(
+      float(result["best_score"]),
+      evaluator.scalar_fitness(n_layout),
+      places=6,
+    )
 
 
 class MarkdownFormatTests(unittest.TestCase):

@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from optiflow.models.scoring import EfficiencyTriple, FieldSpec, FunctionRegistry, InterfaceLayout
 from optiflow.optimization.algorithms import CriterionWeights, calculate_fitness, compute_total_efficiency
+from optiflow.optimization.corrections import DEFAULT_MILLER_PENALTY_WEIGHT, compute_miller_penalty
 from optiflow.optimization.runner import SUITE_STEPS
 
 # key → (идея алгоритма, как ищет решение)
@@ -124,6 +125,7 @@ def build_algorithm_summaries(
   results: Dict[str, Dict[str, object]],
   registry: FunctionRegistry,
   weights: CriterionWeights,
+  penalty_weight: float = DEFAULT_MILLER_PENALTY_WEIGHT,
 ) -> List[AlgorithmRunSummary]:
   summaries: List[AlgorithmRunSummary] = []
   for key, label in SUITE_STEPS:
@@ -157,7 +159,8 @@ def build_algorithm_summaries(
     form_count = 0
     if layout is not None:
       triple = compute_total_efficiency(layout, registry)
-      fitness = calculate_fitness(triple, weights)
+      penalties = compute_miller_penalty(layout, penalty_weight)
+      fitness = calculate_fitness(triple, weights, penalties=penalties)
       form_count = layout.form_count
     summaries.append(
       AlgorithmRunSummary(

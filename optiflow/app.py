@@ -49,6 +49,7 @@ from optiflow.optimization.algorithms import (
   simulated_annealing,
   tabu_search,
 )
+from optiflow.optimization.corrections import compute_miller_penalty
 from optiflow.optimization.runner import (
   SUITE_STEPS,
   histories_from_results,
@@ -2034,7 +2035,7 @@ if _HAS_PYQT5:
         self.weights = self.data_tab.coef.weights()
       _ensure_allowed_controls(layout.fields)
       triple = compute_total_efficiency(layout, self.registry)
-      fitness = calculate_fitness(triple, self.weights)
+      fitness = calculate_fitness(triple, self.weights, penalties=compute_miller_penalty(layout))
       source_name = Path(path).name
       summary = AlgorithmRunSummary(
         key=LOADED_LAYOUT_KEY,
@@ -2145,7 +2146,7 @@ def _rank_layout_candidate(
 ) -> Tuple[int, float]:
   """Prefer a multi-step wizard, then weighted scalar fitness."""
   multistep = int(layout.form_count > 1)
-  fitness = calculate_fitness(triple, weights)
+  fitness = calculate_fitness(triple, weights, penalties=compute_miller_penalty(layout))
   return (multistep, fitness)
 
 
@@ -2191,7 +2192,7 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
     forced_form_idx = space.counts_to_form_indices(forced_counts)
     best_layout = build_interface_layout(fields, controls, forced_form_idx)
     best_triple = compute_total_efficiency(best_layout, registry)
-    best_rank = (1, calculate_fitness(best_triple, weights))
+    best_rank = (1, calculate_fitness(best_triple, weights, penalties=compute_miller_penalty(best_layout)))
     best_name = f"{best_name or 'forced'}-multi"
 
   best_fitness = best_rank[1]
@@ -2209,7 +2210,7 @@ def run_headless_cli(output_path: str | Path = "wizard_output.html") -> Path:
     form_idx = space.counts_to_form_indices(counts)
     best_layout = build_interface_layout(fields, controls, form_idx)
     best_triple = compute_total_efficiency(best_layout, registry)
-    best_fitness = calculate_fitness(best_triple, weights)
+    best_fitness = calculate_fitness(best_triple, weights, penalties=compute_miller_penalty(best_layout))
     best_name = "fallback"
 
   assert best_layout is not None and best_triple is not None

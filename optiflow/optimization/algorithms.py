@@ -23,8 +23,10 @@ from optiflow.models.scoring import (
   partition_counts_to_form_indices,
 )
 from optiflow.optimization.corrections import (
+  DEFAULT_MILLER_PENALTY_WEIGHT,
   apply_element_position_correction,
   apply_form_step_correction,
+  compute_miller_penalty,
 )
 
 
@@ -545,9 +547,15 @@ class DecisionSpace:
 
 
 class ObjectiveEvaluator:
-  def __init__(self, registry: FunctionRegistry, weights: object) -> None:
+  def __init__(
+    self,
+    registry: FunctionRegistry,
+    weights: object,
+    penalty_weight: float = DEFAULT_MILLER_PENALTY_WEIGHT,
+  ) -> None:
     self.registry = registry
     self.weights = _coerce_weights(weights)
+    self.penalty_weight = float(penalty_weight)
     # Legacy alias used by older call sites / docs.
     self.profile = weights if isinstance(weights, TargetProfile) else TargetProfile.balanced()
 
@@ -559,7 +567,8 @@ class ObjectiveEvaluator:
 
   def scalar_fitness(self, layout: InterfaceLayout) -> float:
     triple = self.evaluate_layout(layout)
-    return calculate_fitness(triple, self.weights)
+    penalties = compute_miller_penalty(layout, self.penalty_weight)
+    return calculate_fitness(triple, self.weights, penalties=penalties)
 
   def evaluate_vector(self, x: np.ndarray, space: DecisionSpace) -> EfficiencyTriple:
     layout = space.decode_layout(x, self.registry)
@@ -715,14 +724,23 @@ def nsga2(
       EfficiencyTriple(*objectives[i])
       for i in front0
     ]
+    # Decode once per Pareto-front candidate so the tie-break scalar below
+    # penalizes Inv_3 violations the same way ObjectiveEvaluator.scalar_fitness
+    # and brute_force do, keeping NSGA-II's reported score comparable to theirs.
+    front0_layouts = [space.decode_layout(population[i], evaluator.registry) for i in front0]
+    front0_penalties = [
+      compute_miller_penalty(layout, evaluator.penalty_weight) for layout in front0_layouts
+    ]
     pick = max(
       range(len(triples)),
-      key=lambda i: calculate_fitness(triples[i], evaluator.weights),
+      key=lambda i: calculate_fitness(triples[i], evaluator.weights, penalties=front0_penalties[i]),
     )
     chosen_index = front0[pick]
-    best_layout = space.decode_layout(population[chosen_index], evaluator.registry)
+    best_layout = front0_layouts[pick]
     best_triple = EfficiencyTriple(*objectives[chosen_index])
-    history_best_scalar.append(calculate_fitness(best_triple, evaluator.weights))
+    history_best_scalar.append(
+      calculate_fitness(best_triple, evaluator.weights, penalties=front0_penalties[pick])
+    )
     history_best_triple.append(best_triple)
     if emit_progress(
       control,
