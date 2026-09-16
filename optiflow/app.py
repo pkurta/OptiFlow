@@ -1183,6 +1183,9 @@ if _HAS_PYQT5:
       self.bar.setFormat("%p%")
       self.metrics_label = QtWidgets.QLabel("F = —    P = —    O = —    R = —")
       self.metrics_label.setObjectName("progressMetric")
+      # Wrap: the Inv_3-infeasible annotation ("нижний предел; реальный F = ...")
+      # makes this line longer than the card's fixed max width can fit on one line.
+      self.metrics_label.setWordWrap(True)
       self.time_label = QtWidgets.QLabel("Время: 00:00")
       self.time_label.setObjectName("progressTime")
       self.cancel_btn = QtWidgets.QPushButton("Прервать")
