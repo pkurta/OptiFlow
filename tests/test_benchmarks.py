@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import math
+import random
 import tempfile
 import unittest
 from pathlib import Path
+from typing import List
 
 from optiflow.benchmarks import (
   BENCHMARK_ALGORITHMS,
@@ -33,13 +36,34 @@ from optiflow.optimization.algorithms import (
   classic_genetic_algorithm,
   compute_total_efficiency,
   nsga2,
+  pso,
   random_search,
   redistribute_weight_ticks,
+  simulated_annealing,
 )
 from optiflow.optimization.corrections import (
+  DEFAULT_MILLER_PENALTY_WEIGHT,
   MILLER_HARD_LIMIT,
   compute_miller_penalty,
 )
+
+
+def _mixed_fields_for_miller_tests(n: int, seed: int) -> List[FieldSpec]:
+  """D fields with a TEXT/UNSIGNED/BOOLEAN mix, sized like a realistic form (not the
+  Monte Carlo benchmark's D<=4 toy fixtures) -- for the D=15-20 Inv_3 scenarios."""
+  rng = random.Random(seed)
+  types = [DataType.TEXT, DataType.UNSIGNED, DataType.BOOLEAN]
+  fields: List[FieldSpec] = []
+  for i in range(n):
+    dtype = types[i % 3]
+    size = 1 if dtype == DataType.BOOLEAN else rng.randint(1, 10)
+    fields.append(FieldSpec(f"F{i}", dtype, size))
+  ensure_allowed_controls(fields)
+  return fields
+
+
+def _max_form_size(layout) -> int:
+  return max((len(form.elements) for form in layout.forms), default=0)
 
 
 class CriterionWeightsTests(unittest.TestCase):
@@ -361,6 +385,150 @@ class MillerConstraintTests(unittest.TestCase):
       evaluator.scalar_fitness(n_layout),
       places=6,
     )
+
+
+class RealisticMillerConvergenceTests(unittest.TestCase):
+  """Inv_3 открытый вопрос №1 (аудит, врезка раздела 2.3): действительно ли штраф с
+  DEFAULT_MILLER_PENALTY_WEIGHT=0.01 меняет итоговый best_layout на реалистичном D
+  (15-20 полей), а не остаётся арифметически ничтожным на фоне диапазона E.
+
+  Это эмпирическая проверка поведения оптимизаторов, а не проверка формулы штрафа
+  (та уже покрыта MillerConstraintTests) -- поэтому seed фиксирован для каждого
+  прогона, но используется несколько seed и порог "не хуже N из M", чтобы не
+  зависеть от одного случайного старта популяции/частиц.
+  """
+
+  # D=17, N=2: жёсткая ёмкость экранов 9*2=18 -> Inv_3 структурно выполним, но
+  # с небольшим запасом (1 поле). При этом ансамбль метаэвристик, оптимизируя
+  # только E (P,O,R), уже слегка предпочитает МЕНЬШЕ экранов: apply_form_step_correction
+  # штрафует каждый дополнительный непустой экран мультипликативным коэффициентом
+  # 0.995**(i-1), а evaluate_form/apply_element_position_correction почти
+  # безразличны к тому, как элементы распределены между экранами (их вклад в
+  # E зависит от суммарного числа элементов, а не от разбиения). Из-за этого
+  # без явного штрафа Inv_3 у оптимизатора нет причины избегать k_i>9 -- он
+  # предпочтёт [10, 7] варианту [9, 8], если это даёт чуть меньше "штрафуемых
+  # мастер-шагов" по существующей (доInv_3) модели усталости оператора.
+  _D = 17
+  _N = 2
+
+  def _run_ga(self, evaluator: ObjectiveEvaluator, space: DecisionSpace, seed: int):
+    return classic_genetic_algorithm(
+      space, evaluator, pop_size=30, generations=40, random_seed=seed
+    )
+
+  def _run_pso(self, evaluator: ObjectiveEvaluator, space: DecisionSpace, seed: int):
+    return pso(space, evaluator, swarm_size=30, iterations=50, random_seed=seed)
+
+  def _run_sa(self, evaluator: ObjectiveEvaluator, space: DecisionSpace, seed: int):
+    # 300 = runner.py's own default SA iteration budget (see SUITE_STEPS/"SA"
+    # in optiflow/optimization/runner.py) -- deliberately NOT bumped, so this
+    # test reflects what a user actually gets out of the box.
+    return simulated_annealing(space, evaluator, iterations=300, random_seed=seed)
+
+  def test_default_penalty_weight_changes_best_layout_at_realistic_d(self) -> None:
+    fields = _mixed_fields_for_miller_tests(self._D, seed=1)
+    weights = CriterionWeights.balanced()
+    space = DecisionSpace(fields, max_forms=self._N)
+    self.assertLessEqual(self._D, MILLER_HARD_LIMIT * self._N, "фикстура должна быть Inv_3-выполнима")
+
+    runners = {"GA": self._run_ga, "PSO": self._run_pso, "SA": self._run_sa}
+    seeds = range(5)
+
+    for name, runner in runners.items():
+      with self.subTest(algorithm=name):
+        unpenalized = ObjectiveEvaluator(FunctionRegistry(), weights, penalty_weight=0.0)
+        penalized = ObjectiveEvaluator(
+          FunctionRegistry(), weights, penalty_weight=DEFAULT_MILLER_PENALTY_WEIGHT
+        )
+
+        unpenalized_max_ks = [
+          _max_form_size(runner(unpenalized, space, seed)["best_layout"]) for seed in seeds
+        ]
+        penalized_max_ks = [
+          _max_form_size(runner(penalized, space, seed)["best_layout"]) for seed in seeds
+        ]
+
+        violations_without_penalty = sum(1 for k in unpenalized_max_ks if k > MILLER_HARD_LIMIT)
+        compliant_with_penalty = sum(1 for k in penalized_max_ks if k <= MILLER_HARD_LIMIT)
+
+        # Baseline: without the Inv_3 penalty, E's own gradient is not enough to
+        # keep the optimizer under the hard limit at this D -- if this ever starts
+        # failing, the baseline claim in the audit doc ("penalty_weight=0.01 changes
+        # behavior, it isn't fighting a baseline that already complies") needs revisiting.
+        self.assertGreaterEqual(
+          violations_without_penalty, 4,
+          f"{name}: unpenalized baseline unexpectedly complies with Inv_3 most of the "
+          f"time at D={self._D}, N={self._N} (max_k per seed={unpenalized_max_ks}); "
+          "this test's premise (penalty is needed here) may no longer hold.",
+        )
+        # With the default penalty_weight, compliance should be reliable, not incidental.
+        self.assertGreaterEqual(
+          compliant_with_penalty, 4,
+          f"{name}: DEFAULT_MILLER_PENALTY_WEIGHT={DEFAULT_MILLER_PENALTY_WEIGHT} did not "
+          f"reliably enforce Inv_3 at D={self._D}, N={self._N} (max_k per seed="
+          f"{penalized_max_ks}); this is evidence the default weight may be too small "
+          "for this class of problem sizes, not a formula bug.",
+        )
+
+
+class MillerInfeasibilityTests(unittest.TestCase):
+  """Inv_3 открытый вопрос №2 (аудит, врезка раздела 2.3): поведение при D > 9N,
+  когда ограничение структурно невыполнимо ни при каком разбиении полей по экранам.
+  """
+
+  _D = 30
+  _N = 2  # capacity = MILLER_HARD_LIMIT * N = 18 < 30 -> Inv_3 unsatisfiable by construction
+
+  def test_decision_space_accepts_infeasible_d_n_without_any_guard(self) -> None:
+    """Фиксирует ТЕКУЩЕЕ поведение: ни DecisionSpace, ни его конструктор не
+    проверяют D <= MILLER_HARD_LIMIT * max_forms. Это не баг сам по себе -- но
+    кандидат на доработку (предупреждение в GUI "Inv_3 недостижим при данных
+    D и N"), которая явно НЕ входит в объём этой задачи."""
+    self.assertGreater(self._D, MILLER_HARD_LIMIT * self._N, "фикстура должна быть заведомо неразрешимой")
+    fields = _mixed_fields_for_miller_tests(self._D, seed=2)
+    space = DecisionSpace(fields, max_forms=self._N)  # no exception, no warning surface
+    self.assertEqual(space.control_dim(), self._D)
+
+  def test_infeasible_space_degrades_predictably_not_crashes(self) -> None:
+    """Inv_1 (полнота полей) остаётся обеспечен репарацией декодера, penalty
+    остаётся положительным при ЛЮБОМ валидном разбиении (ожидаемо и корректно --
+    не баг), и ни decode_layout, ни scalar_fitness не бросают исключений."""
+    fields = _mixed_fields_for_miller_tests(self._D, seed=2)
+    weights = CriterionWeights.balanced()
+    space = DecisionSpace(fields, max_forms=self._N)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
+
+    for seed in range(10):
+      random.seed(seed)
+      vector = space.random_vector()
+      layout = space.decode_layout(vector, evaluator.registry)  # must not raise
+      total_fields_in_layout = sum(len(form.elements) for form in layout.forms)
+      self.assertEqual(total_fields_in_layout, self._D, "Inv_1 must hold even when Inv_3 cannot")
+
+      score = evaluator.scalar_fitness(layout)  # must not raise
+      self.assertTrue(math.isfinite(score))
+      penalty = compute_miller_penalty(layout, evaluator.penalty_weight)
+      self.assertGreater(penalty, 0.0, "D>9N: every valid partition must violate Inv_3 somewhere")
+
+  def test_metaheuristic_still_minimizes_violation_via_balanced_split(self) -> None:
+    """Даже когда Inv_3 недостижим, минимум штрафа (суммы квадратов превышений
+    при фиксированном D) достигается на максимально равномерном разбиении --
+    поэтому осмысленный оптимизатор должен сходиться именно к нему, а не к
+    произвольному дисбалансу. D=30 делится на N=2 ровно поровну (15/15), так
+    что это однозначная эталонная точка."""
+    fields = _mixed_fields_for_miller_tests(self._D, seed=2)
+    weights = CriterionWeights.balanced()
+    space = DecisionSpace(fields, max_forms=self._N)
+    evaluator = ObjectiveEvaluator(FunctionRegistry(), weights)
+
+    result = classic_genetic_algorithm(space, evaluator, pop_size=20, generations=20, random_seed=1)
+    layout = result["best_layout"]
+    sizes = [len(form.elements) for form in layout.forms]
+
+    self.assertEqual(sum(sizes), self._D)
+    # Balanced optimum for D=30, N=2 is exactly [15, 15]; allow a small margin
+    # for GA's stochastic search instead of requiring the exact optimum.
+    self.assertLessEqual(max(sizes) - min(sizes), 4)
 
 
 class MarkdownFormatTests(unittest.TestCase):
