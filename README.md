@@ -2,7 +2,7 @@
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-3776AB?logo=python&logoColor=white)
 ![License MIT](https://img.shields.io/badge/license-MIT-green.svg)
-![OptiFlow v1.6](https://img.shields.io/badge/OptiFlow-v1.6-orange.svg)
+![OptiFlow v1.7](https://img.shields.io/badge/OptiFlow-v1.7-orange.svg)
 ![Status Active](https://img.shields.io/badge/status-active-brightgreen.svg)
 
 > *OptiFlow: PyQt5 framework for multi-step UI/wizard combinatorial synthesis via metaheuristics (NSGA-II, GA, PSO, SA, ACO) and multiplicative cognitive scoring model.*
@@ -35,11 +35,21 @@ $$
 
 ### Скалярная свёртка для оптимизации
 
-Для сравнения алгоритмов и однокритериальной оптимизации используется нормированная линейная свёртка:
+Для сравнения алгоритмов и однокритериальной оптимизации используется нормированная линейная свёртка со штрафом:
 
 $$
-F = w_1 P + w_2 O + w_3 R,\quad w_1 + w_2 + w_3 = 1,\quad w_i \ge 0.
+F = w_1 P + w_2 O + w_3 R - \mathrm{Penalties},\quad w_1 + w_2 + w_3 = 1,\quad w_i \ge 0.
 $$
+
+### Инвариант Inv_3 — когнитивный предел Миллера
+
+Число элементов \(k_i\) на любом непустом экране компоновки штрафуется при превышении жёсткой границы \(7\pm2=9\):
+
+$$
+\mathrm{Penalties} = w_{penalty}\sum_i \max(0,\,k_i-9)^2,
+$$
+
+квадратично по превышению — `compute_miller_penalty()` в [`optiflow/optimization/corrections.py`](optiflow/optimization/corrections.py), единообразно применяется в эталонном переборе и во всех метаэвристиках через `ObjectiveEvaluator.scalar_fitness`. Штраф структурно недостижим при \(D>9N\) (число полей больше суммарной ёмкости экранов) — в этом случае GUI и headless-режим показывают предупреждение с конкретными числами, не блокируя синтез. Отображаемое пользователю и экспортируемое значение \(F\) приведено к \([0,1]\) (`clip_fitness_for_display`); нескорректированный скаляр, которым алгоритмы сравнивают решения, остаётся доступен как `raw_fitness` в отчётах и JSON.
 
 ### Эмпирические функции \(P, O, R\)
 
@@ -53,7 +63,8 @@ $$
 |-----------|------------|
 | `optiflow/models/scoring.py` | Типы данных, layout wizard, `FunctionRegistry`, расчёт \(P,O,R\) |
 | `optiflow/models/layout_io.py` | JSON синтезированного wizard (`optiflow-interface-layout`) |
-| `optiflow/optimization/algorithms.py` | Метаэвристики, `CriterionWeights`, `calculate_fitness()` |
+| `optiflow/optimization/algorithms.py` | Метаэвристики, `CriterionWeights`, `calculate_fitness()`, `clip_fitness_for_display()` |
+| `optiflow/optimization/corrections.py` | Штраф Inv_3 (`compute_miller_penalty`), проверка достижимости (`miller_feasibility_warning`), мультипликативные ПЭН-коррекции |
 | `optiflow/optimization/runner.py` | Suite-прогон алгоритмов, контроль времени/итераций |
 | `optiflow/benchmarks.py` | Monte Carlo-бенчмарк, Precision Rate vs Brute Force |
 | `optiflow/ui/` | HTML-генератор, отчёты, интерпретация Gemini |
@@ -104,7 +115,7 @@ Suite запускается последовательно из GUI (вклад
 
 ![LLM-интерпретация результатов (Gemini Flash)](docs/screenshots/optiflow_07_interpretation.webp)
 
-**Вкладки (v1.6):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
+**Вкладки (v1.7):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
 
 На вкладке «Данные» сценарий «Баланс» задаёт точные веса \(w_1=w_2=w_3=1/3\); именованные сценарии — «Упор на результативность / оперативность / ресурсоэкономность», без привязки к частным организациям. Синтезированный мастер сохраняется и открывается повторно как JSON (`optiflow-interface-layout`) с вкладки «Визуализация» или из меню «Файл».
 
@@ -156,10 +167,10 @@ python3 -m optiflow.app
 ### Unit-тесты
 
 ```bash
-python3 -m unittest tests.test_benchmarks tests.test_layout_io -v
+python3 -m unittest discover -s tests -v
 ```
 
-Проверяются: Brute Force (Ground Truth), Classic GA, нормировка весов, JSON layout, Monte Carlo-бенчмарк.
+Проверяются: Brute Force (Ground Truth), Classic GA, нормировка весов, JSON layout, Monte Carlo-бенчмарк, штраф Inv_3 и его достижимость (`MillerConstraintTests`, `RealisticMillerConvergenceTests`, `MillerInfeasibilityTests`, `MillerFeasibilityWarningTests`), клиппинг \(F\) для отображения (`FitnessDisplayClippingTests`), регрессия `aco()` на больших пространствах (`AcoInv3RegressionTests`).
 
 ### Monte Carlo-отчёт
 
@@ -167,7 +178,15 @@ python3 -m unittest tests.test_benchmarks tests.test_layout_io -v
 python3 -c "import logging; from pathlib import Path; from optiflow.benchmarks import run_optimization_benchmark; logging.basicConfig(level=logging.INFO); run_optimization_benchmark(runs_count=100, random_seed=42, output_dir=Path('.'), log_markdown=True)"
 ```
 
-Генерируется `benchmark_report.md` с метриками **Precision Rate** и скорости сходимости относительно Brute Force.
+Генерируется `benchmark_report.md` с метриками **Precision Rate** и скорости сходимости относительно Brute Force. Monte Carlo намеренно ограничен \(D\le 4\), чтобы Brute Force оставался вычислимым.
+
+### Эксперимент \(T_{cpu}(M)\) / \(\Delta E\) / `constraint_pass_rate` (главы 4–5)
+
+```bash
+python3 scripts/run_dissertation_experiments.py --repeats 10
+```
+
+Прогоняет полный ансамбль (`run_optimization_suite`) на \(M\in\{5,10,20,50,100\}\) полях (\(N=\lceil M/9\rceil\), Inv_3 структурно достижим) плюс одну заведомо Inv_3-невыполнимую точку. Сырые данные и сводка — [`docs/dissertation/experiments/`](docs/dissertation/experiments/); там же зафиксировано окружение прогона и авторское допущение о базовой компоновке \(S_0\) (в проекте формально не определена).
 
 Подробности — [`TESTING_GUIDE.md`](TESTING_GUIDE.md).
 
