@@ -23,7 +23,7 @@ $$
 E = \langle P,\ O,\ R \rangle,
 $$
 
-где \(P\) — результативность (*Potency*), \(O\) — оперативность (*Operativeness*), \(R\) — ресурсоэкономность (*Resource-saving*).
+где $P$ — результативность (*Potency*), $O$ — оперативность (*Operativeness*), $R$ — ресурсоэкономность (*Resource-saving*).
 
 Суммарная эффективность компоновки вычисляется **мультипликативно** (модель накопления психоэмоционального напряжения, ПЭН):
 
@@ -31,7 +31,7 @@ $$
 E_{\mathrm{Total}} = \prod (\mathrm{Corrected\ Forms}) \times \prod (\mathrm{Double\text{-}Corrected\ Elements}).
 $$
 
-Коррекции зависят от позиции элемента на форме (\(j\)) и номера шага мастера (\(i\)).
+Коррекции зависят от позиции элемента на форме ($j$) и номера шага мастера ($i$).
 
 ### Скалярная свёртка для оптимизации
 
@@ -43,15 +43,15 @@ $$
 
 ### Инвариант Inv_3 — когнитивный предел Миллера
 
-Число элементов \(k_i\) на любом непустом экране компоновки штрафуется при превышении жёсткой границы \(7\pm2=9\):
+Число элементов $k_i$ на любом непустом экране компоновки штрафуется при превышении жёсткой границы $7\pm2=9$:
 
 $$
 \mathrm{Penalties} = w_{penalty}\sum_i \max(0,\,k_i-9)^2,
 $$
 
-квадратично по превышению — `compute_miller_penalty()` в [`optiflow/optimization/corrections.py`](optiflow/optimization/corrections.py), единообразно применяется в эталонном переборе и во всех метаэвристиках через `ObjectiveEvaluator.scalar_fitness`. Штраф структурно недостижим при \(D>9N\) (число полей больше суммарной ёмкости экранов) — в этом случае GUI и headless-режим показывают предупреждение с конкретными числами, не блокируя синтез. Отображаемое пользователю и экспортируемое значение \(F\) приведено к \([0,1]\) (`clip_fitness_for_display`); нескорректированный скаляр, которым алгоритмы сравнивают решения, остаётся доступен как `raw_fitness` в отчётах и JSON.
+квадратично по превышению — `compute_miller_penalty()` в [`optiflow/optimization/corrections.py`](optiflow/optimization/corrections.py), единообразно применяется в эталонном переборе и во всех метаэвристиках через `ObjectiveEvaluator.scalar_fitness`. Штраф структурно недостижим при $D>9N$ (число полей больше суммарной ёмкости экранов) — в этом случае GUI и headless-режим показывают предупреждение с конкретными числами, не блокируя синтез. Отображаемое пользователю и экспортируемое значение $F$ приведено к $[0,1]$ (`clip_fitness_for_display`); нескорректированный скаляр, которым алгоритмы сравнивают решения, остаётся доступен как `raw_fitness` в отчётах и JSON.
 
-### Эмпирические функции \(P, O, R\)
+### Эмпирические функции $P, O, R$
 
 Атомарные показатели контролов задаются эмпирическими функциями по данным Курта П.А. (2024) — реестр `KURTA_2024_CONTROL_FUNCTIONS`, конфигурация [`task_settings.json`](task_settings.json) (`optiflow-task-settings` v2).
 
@@ -61,7 +61,7 @@ $$
 
 | Компонент | Назначение |
 |-----------|------------|
-| `optiflow/models/scoring.py` | Типы данных, layout wizard, `FunctionRegistry`, расчёт \(P,O,R\) |
+| `optiflow/models/scoring.py` | Типы данных, layout wizard, `FunctionRegistry`, расчёт $P,O,R$ |
 | `optiflow/models/layout_io.py` | JSON синтезированного wizard (`optiflow-interface-layout`) |
 | `optiflow/optimization/algorithms.py` | Метаэвристики, `CriterionWeights`, `calculate_fitness()`, `clip_fitness_for_display()` |
 | `optiflow/optimization/corrections.py` | Штраф Inv_3 (`compute_miller_penalty`), проверка достижимости (`miller_feasibility_warning`), мультипликативные ПЭН-коррекции |
@@ -70,14 +70,14 @@ $$
 | `optiflow/ui/` | HTML-генератор, отчёты, интерпретация Gemini |
 | `optiflow/app.py` | PyQt5 GUI и Headless CLI fallback |
 
-**Постановка задачи:** для \(D\) полей выбрать тип контрола и разбиение по \(N\) экранам мастера. Хромосома: \(D\) генов контролов + \(N\) весов разбиения.
+**Постановка задачи:** для $D$ полей выбрать тип контрола и разбиение по $N$ экранам мастера. Хромосома: $D$ генов контролов + $N$ весов разбиения.
 
 **Допустимые контролы:**
 
 | `DataType` | Контролы | Параметр «Размер» |
 |------------|----------|-------------------|
-| `BOOLEAN` | `CHECKBOX` | фиксирован \(=1\) |
-| `UNSIGNED` | `SPINNER`, `SLIDER` | диапазон \(\Delta\) |
+| `BOOLEAN` | `CHECKBOX` | фиксирован $=1$ |
+| `UNSIGNED` | `SPINNER`, `SLIDER` | диапазон $\Delta$ |
 | `TEXT` | `TEXTBOX`, `DROPDOWNLIST` | длина строки / число пунктов |
 
 ### Поддерживаемые алгоритмы оптимизации
@@ -85,7 +85,7 @@ $$
 | Алгоритм | Ключ | Роль |
 |----------|------|------|
 | NSGA-II | `NSGA-II` | Многокритериальный поиск по Парето-фронту |
-| Classic GA | `GA` | Однокритериальная эволюция по \(F\) |
+| Classic GA | `GA` | Однокритериальная эволюция по $F$ |
 | Brute Force | `BruteForce` | **Ground Truth** — исчерпывающий перебор (лимит 50 000 комбинаций) |
 | PSO | `PSO` | Алгоритм роя частиц |
 | Simulated Annealing | `SA` | Имитация отжига |
@@ -101,13 +101,13 @@ Suite запускается последовательно из GUI (вклад
 
 ## Интерфейс
 
-![Постановка задачи: поля, веса \(1/3\) в «Балансе», сценарии «Упор на …»](docs/screenshots/optiflow_01_data.webp)
+![Постановка задачи: поля, веса $1/3$ в «Балансе», сценарии «Упор на …»](docs/screenshots/optiflow_01_data.webp)
 
 ![Запуск suite метаэвристик](docs/screenshots/optiflow_02_algorithms.webp)
 
 ![Настройка функций эффективности и лимитов алгоритмов](docs/screenshots/optiflow_03_task_settings.webp)
 
-![Сходимость алгоритмов к плато \(F\)](docs/screenshots/optiflow_04_charts.webp)
+![Сходимость алгоритмов к плато $F$](docs/screenshots/optiflow_04_charts.webp)
 
 ![Предпросмотр синтезированного HTML-мастера; сохранение и загрузка JSON](docs/screenshots/optiflow_05_visualization.webp)
 
@@ -117,7 +117,7 @@ Suite запускается последовательно из GUI (вклад
 
 **Вкладки (v1.7):** Данные → Алгоритмы → Настройка задачи → Графики → Визуализация → Отчёт → Интерпретация.
 
-На вкладке «Данные» сценарий «Баланс» задаёт точные веса \(w_1=w_2=w_3=1/3\); именованные сценарии — «Упор на результативность / оперативность / ресурсоэкономность», без привязки к частным организациям. Синтезированный мастер сохраняется и открывается повторно как JSON (`optiflow-interface-layout`) с вкладки «Визуализация» или из меню «Файл».
+На вкладке «Данные» сценарий «Баланс» задаёт точные веса $w_1=w_2=w_3=1/3$; именованные сценарии — «Упор на результативность / оперативность / ресурсоэкономность», без привязки к частным организациям. Синтезированный мастер сохраняется и открывается повторно как JSON (`optiflow-interface-layout`) с вкладки «Визуализация» или из меню «Файл».
 
 **Конфигурация:**
 
@@ -170,7 +170,7 @@ python3 -m optiflow.app
 python3 -m unittest discover -s tests -v
 ```
 
-Проверяются: Brute Force (Ground Truth), Classic GA, нормировка весов, JSON layout, Monte Carlo-бенчмарк, штраф Inv_3 и его достижимость (`MillerConstraintTests`, `RealisticMillerConvergenceTests`, `MillerInfeasibilityTests`, `MillerFeasibilityWarningTests`), клиппинг \(F\) для отображения (`FitnessDisplayClippingTests`), регрессия `aco()` на больших пространствах (`AcoInv3RegressionTests`).
+Проверяются: Brute Force (Ground Truth), Classic GA, нормировка весов, JSON layout, Monte Carlo-бенчмарк, штраф Inv_3 и его достижимость (`MillerConstraintTests`, `RealisticMillerConvergenceTests`, `MillerInfeasibilityTests`, `MillerFeasibilityWarningTests`), клиппинг $F$ для отображения (`FitnessDisplayClippingTests`), регрессия `aco()` на больших пространствах (`AcoInv3RegressionTests`).
 
 ### Monte Carlo-отчёт
 
@@ -178,15 +178,15 @@ python3 -m unittest discover -s tests -v
 python3 -c "import logging; from pathlib import Path; from optiflow.benchmarks import run_optimization_benchmark; logging.basicConfig(level=logging.INFO); run_optimization_benchmark(runs_count=100, random_seed=42, output_dir=Path('.'), log_markdown=True)"
 ```
 
-Генерируется `benchmark_report.md` с метриками **Precision Rate** и скорости сходимости относительно Brute Force. Monte Carlo намеренно ограничен \(D\le 4\), чтобы Brute Force оставался вычислимым.
+Генерируется `benchmark_report.md` с метриками **Precision Rate** и скорости сходимости относительно Brute Force. Monte Carlo намеренно ограничен $D\le 4$, чтобы Brute Force оставался вычислимым.
 
-### Эксперимент \(T_{cpu}(M)\) / \(\Delta E\) / `constraint_pass_rate` (главы 4–5)
+### Эксперимент $T_{cpu}(M)$ / $\Delta E$ / `constraint_pass_rate` (главы 4–5)
 
 ```bash
 python3 scripts/run_dissertation_experiments.py --repeats 10
 ```
 
-Прогоняет полный ансамбль (`run_optimization_suite`) на \(M\in\{5,10,20,50,100\}\) полях (\(N=\lceil M/9\rceil\), Inv_3 структурно достижим) плюс одну заведомо Inv_3-невыполнимую точку. Сырые данные и сводка — [`docs/dissertation/experiments/`](docs/dissertation/experiments/); там же зафиксировано окружение прогона и авторское допущение о базовой компоновке \(S_0\) (в проекте формально не определена).
+Прогоняет полный ансамбль (`run_optimization_suite`) на $M\in\{5,10,20,50,100\}$ полях ($N=\lceil M/9\rceil$, Inv_3 структурно достижим) плюс одну заведомо Inv_3-невыполнимую точку. Сырые данные и сводка — [`docs/dissertation/experiments/`](docs/dissertation/experiments/); там же зафиксировано окружение прогона и авторское допущение о базовой компоновке $S_0$ (в проекте формально не определена).
 
 Подробности — [`TESTING_GUIDE.md`](TESTING_GUIDE.md).
 
