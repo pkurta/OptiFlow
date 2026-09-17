@@ -626,7 +626,8 @@ if _HAS_PYQT5:
       weights_layout.addWidget(self.coef)
       hint = QtWidgets.QLabel(
         "P, O и R — расчётные свойства готового интерфейса, не вход. "
-        "Здесь задаются только веса свёртки F = w₁P + w₂O + w₃R, сумма всегда равна 1. "
+        "Здесь задаются только веса свёртки F = w₁P + w₂O + w₃R − Penalties, "
+        "сумма весов w₁+w₂+w₃ всегда равна 1. "
         "В сценарии «Баланс» веса равны точно 1/3; два знака после запятой — в «Свой вариант»."
       )
       hint.setWordWrap(True)
@@ -1385,7 +1386,7 @@ if _HAS_PYQT5:
         )
         self._line_by_label[label] = line
 
-      ax.set_title("Скорость выхода на плато (F = w₁P + w₂O + w₃R)")
+      ax.set_title("Скорость выхода на плато (F = w₁P + w₂O + w₃R − Penalties)")
       ax.set_xlabel("Итерации")
       ax.set_ylabel("Скалярная пригодность F")
       self._legend = ax.legend(loc="best", framealpha=0.92)
